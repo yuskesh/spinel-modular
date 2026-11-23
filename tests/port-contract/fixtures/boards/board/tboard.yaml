@@ -1,0 +1,11 @@
+# a control board: values only
+format: spinel-board
+version: 1
+chip: tchip
+clock: { crystal_hz: 12000000 }
+console: { uart: 0, baud: 115200 }
+flash: { boot: plain }
+policy:
+  stack_bytes: 32768
+  gc_threshold_kb: 16
+  gc_slab: 0

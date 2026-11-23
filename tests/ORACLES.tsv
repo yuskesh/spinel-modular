@@ -1,0 +1,48 @@
+# tests/ORACLES.tsv -- every oracle in tests/ and tools/, and every file that
+# looks like one and is not.
+#
+# An oracle is a check against another implementation's behaviour:
+# CRuby, a reference C build, a JAX or IREE reference, a replay of
+# a recorded run under CRuby, a byte comparison with another implementation's
+# recorded output. It runs only when the person running the suite asks for
+# it, with ALLOW_ORACLE=1. A comparison within one implementation (two of its paths, or
+# its old and new build) is not one, with one exception: a build by
+# BASELINE_KERNEL, a kernel built without the change, compared with this one is
+# an oracle. tools/oracle/gate enforces the contract.
+#
+# COLUMNS
+#   path      the file, from the repository root
+#   section   the name the file's gate call uses (tools/oracle/gate, or
+#             OracleGate.allow? in Ruby); `whole` gates the file at its top;
+#             `-` for a row that has no gate call
+#   class     named       the maintainers named it an oracle; gated
+#             definition  it fits the definition above; gated
+#             confirm     gated until the maintainers settle whether it is an
+#                         oracle
+#             program     a program that performs a comparison and is run only
+#                         from a gated section; no gate of its own
+#             exempt      it mentions CRuby, an oracle or a replay, and is not
+#                         one: the maintainers ruled so, or the comparison stays within
+#                         one implementation, or the word names something else
+#             ungated     an oracle this mechanism does not gate; the reason
+#                         says why and who starts it
+#   what      what a gated section compares with (printed by the gate), or why
+#             a row is not gated
+#
+# tests/oracle/check.sh holds this list to the tree: every gate call has its
+# row and every gated row its call, and every file the oracle patterns find has
+# a row. Read it before adding a row.
+#
+#path	section	class	what
+tests/core-boundary/arithmetic.sh	language-oracle	named	oracle.rb: the case table against CRuby's integers
+tests/core-boundary/arithmetic.sh	mutation-controls	named	oracle.rb over one-cell mutations of the case table, under CRuby
+tests/core-report/run.sh	bound-oracle	named	oracle.rb: every reported bound against CRuby running the fixture
+tests/core-report/run.sh	baseline-kernel	named	plain objects against BASELINE_KERNEL's, a kernel built without the change
+tests/native-core/run.sh	cruby-answers	named	each core-backed executable's answer against CRuby's
+tests/native-core/driver.sh	cruby-answer	named	the driver's executable against CRuby's answer
+tests/native-core/binding-probe.sh	cruby-min	named	INT64_MIN+1 - 1 printed by CRuby beside the compiled program
+tests/native-core/macos-probe.rb	cruby-answers	definition	each of nine fixtures' core-backed executable on macOS arm64 against CRuby's answer
+tests/core-boundary/oracle.rb	-	program	run by arithmetic.sh's two gated lanes
+tests/core-report/oracle.rb	-	program	run by core-report/run.sh's bound-oracle section
+tests/freestanding/ints/mkcases.rb	-	exempt	the case generator; its --host output is a driver for a host build, which no lane here builds or compares with
+tests/core-boundary/intrinsics.sh	-	exempt	part 3 loads the CRuby route's prelude (tools/core/intrinsics.rb, our own) and checks it against the hand-computed values of cases.tsv; it compares with no other implementation

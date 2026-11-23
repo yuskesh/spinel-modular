@@ -1,0 +1,23 @@
+# tools/bare-full/runtime/defines -- the defines the Spinel runtime and the
+# generated program are compiled with, one per line. spinel-bare-full passes
+# each as -D<line> to both: a define that reaches only one side links and is
+# silently wrong.
+#
+# The first four select the runtime's paths for a target with no operating
+# system: no signals, one worker, and the branches the runtime keeps for
+# wasm32-wasi, which has no processes, sockets or second stacks either.
+SP_NO_SIGNALS
+SP_MAX_WORKERS=1
+__wasi__
+_GNU_SOURCE
+# SP_ALLOC_STATS and SP_STR_SHAPE_MAX size diagnostic tables; 1 keeps them out
+# of RAM.
+SP_ALLOC_STATS=1
+SP_STR_SHAPE_MAX=1
+# The collector's tables. They fall back safely when full: minor collections
+# become full ones, or the table grows on the heap.
+SP_GC_STACK_MAX=256
+SP_GC_REMEMBERED_MAX=1024
+SP_GC_MARK_STACK_MAX=256
+SP_GC_PINNED_MAX=256
+SP_DYN_SYMS_MAX=256

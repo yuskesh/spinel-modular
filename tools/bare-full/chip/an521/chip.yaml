@@ -1,0 +1,19 @@
+# The AN521 image of the MPS2+ (SSE-200 subsystem), as QEMU's mps2-an521
+# models it: the secure Cortex-M33, a CMSDK APB UART.
+format: spinel-chip
+version: 1
+archs: [armv8-m.main]
+cpu: m33
+values:
+  flash: { origin: 0x10000000, bytes: 4194304 }   # SSRAM-0's secure alias: the code
+  ram: { origin: 0x38000000, bytes: 4194304 }     # SSRAM-1 and SSRAM-2's secure alias
+# the flash an image may be loaded in: the two keys name the values that say it
+image:
+  flash_origin: chip.flash.origin
+  flash_bytes: chip.flash.bytes
+board:
+  clock.core_hz: { type: int, min: 1 }
+  console.uart: { type: int, one_of: [0] }
+  # the UART's BAUDDIV register as written, not a baud rate: 16 is its
+  # smallest legal value, and the model has no line rate
+  console.baud_divisor: { type: int, min: 16, max: 1048575 }

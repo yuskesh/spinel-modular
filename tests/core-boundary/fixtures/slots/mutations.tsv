@@ -1,0 +1,17 @@
+# Controls. Each row changes ONE point of ONE source; the harness built from
+# the changed kernels must then fail the named mode over the same trace. A
+# control that still passed would mean the trace cannot see that part of the
+# computation.
+#
+#id	file	old	new	mode	what it would hide
+take-oldest-unused	slot_take.rb	state[1] = fresh + 1	state[1] = fresh + 2	run	the pool skipping a slot it never handed out
+take-forgets-chain	slot_take.rb	state[0] = link[back]	state[0] = -1	run	a pool that reuses one returned slot and loses the rest
+take-capacity	slot_take.rb	fresh >= n_link ? 1 : 0	fresh > n_link ? 1 : 0	refuse	the pool handing out a slot past its end
+give-chain	slot_give.rb	link[i] = state[0]	link[i] = -1	run	returned slots that do not remember each other
+put-at-head	queue_put.rb	nxt[last] = i	nxt[i] = last	run	a queue that never links its newest slot in
+put-length	queue_put.rb	q[2] = q[2] + 1	q[2] = q[2] + 2	run	a length that counts each slot twice
+take-tail	queue_take.rb	q[1] = -1	q[1] = first	run	an emptied queue that still names a newest slot
+drop-relink	queue_drop.rb	nxt[before] = after	nxt[before] = at	run	a dropped slot left in the chain
+drop-tail	queue_drop.rb	q[1] = before	q[1] = at	run	the newest slot dropped and still named newest
+drop-mark	queue_drop.rb	vals[at] = DROPPED	vals[at] = 0	run	a dropped slot keeping a value that is not the marker
+drop-bound	queue_drop.rb	steps >= n_nxt	steps >= 3	refuse	a bound that stops a chain of full length

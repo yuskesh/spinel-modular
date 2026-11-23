@@ -1,0 +1,12 @@
+# The platform-first form of wasm32-worker.yaml.
+#
+# There is no `platform: none` in this form: the honest statement was never "nobody
+# is there" but "a platform is there and this module receives nothing from it"
+# -- the JS host / wasm-ld supply the link, the module imports only its trap
+# hook.  supplies: trap-only says exactly that.  `arch:` is omitted: workers'
+# arch menu has one entry (wasm32), so it is derived.
+#
+# The target-first file stays beside this one; the lanes under
+# tests/freestanding read it.
+platform: workers
+supplies: trap-only

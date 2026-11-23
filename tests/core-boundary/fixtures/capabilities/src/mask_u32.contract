@@ -1,0 +1,5 @@
+core-contract 1
+root src/mask_u32.rb
+entry mask_u32
+result i64
+param v scalar i64

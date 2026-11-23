@@ -1,0 +1,18 @@
+core-contract 1
+root src/col_fill.rb
+entry col_fill
+result i64
+param scr buffer u8 inout count n_scr
+param n_scr scalar u64
+param pat buffer u8 in count n_pat
+param n_pat scalar u64
+param lut buffer u8 in count n_lut
+param n_lut scalar u64
+param x scalar i64
+param y0 scalar i64
+param y1 scalar i64
+param start scalar i64
+param step scalar i64
+param period scalar i64
+param row scalar i64
+param width scalar i64

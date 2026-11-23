@@ -1,0 +1,652 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# tools/platform/port-check -- hold one bare-metal build to the port contract.
+#
+# usage: port-check --contract FILE --arch ARCH --tier TIER
+#                   --part NAME=FILE [--part NAME=FILE ...]
+#                   --image IMAGE --map MAP [--report FILE] [--revision REV]
+#        port-check --contract FILE --list
+#
+# --list reads the contract, refuses a malformed one, and prints one line per
+# name: capability, tier, architectures, symbol or section, name, supplier,
+# users, required or optional (tab-separated). It reads no build.
+#
+# The contract (tools/platform/port-contract.yaml) names the parts of a build
+# and every symbol that may cross from one part to another. This tool is given
+# the files of each part, the linked image and the linker's map of it
+# (ld.lld -Map), measures which symbols do cross in that image, and refuses
+# the build when
+#
+#   undeclared  a symbol crosses that the contract does not name for that
+#               supplier, that user, this architecture and this tier; or a
+#               part with a closed surface refers, anywhere in its files, to
+#               a symbol no row gives it;
+#   missing     a name the contract requires is not defined by its supplier
+#               (for the link script: by a line of the script), or the
+#               image's definition is another part's; a required section is
+#               not in the image;
+#   stray       a part with a closed surface defines another global;
+#   unlisted    the image links a file that was given to no part;
+#   unresolved  a reference is answered only by the linker's own default, or
+#               the image's entry is no global symbol.
+#
+# It holds no symbol, section or part name of its own: all of them come from
+# the contract file. Exit status: 0 accepted, 1 refused, 2 the check could not
+# be made (usage, a missing file or tool, a malformed contract, a map that is
+# not the image's).
+#
+# How a crossing is measured: from the image, not from a model of the link.
+# The map lists every input section the link kept, with the file it came
+# from, and every symbol with the file that defines the copy in the image. A
+# kept section's relocations (llvm-readobj -r on the same file) name the
+# symbols it refers to. A reference from a kept section of one part to a
+# global the image takes from another part is a crossing; a global the map
+# places in no file and a line of the script assigns is the link script's.
+# So a section the link dropped asks for nothing, a section only the script
+# keeps (KEEP) is counted, a weak reference counts when the image has the
+# symbol, and of two definitions the one counted is the one linked.
+#
+# What that does not see is stated in docs/platform/port-contract.md: two
+# sections of one object with the same name are taken together; the script's
+# own references to part symbols, other than the entry, are not measured.
+#
+# NM, READOBJ and READELF name the tools; otherwise they are llvm-nm,
+# llvm-readobj and llvm-readelf under LLVM_PREFIX/bin, then on PATH.
+
+require "digest"
+require "json"
+require "open3"
+require "set"
+require "tmpdir"
+require "yaml"
+
+PROG = "port-check"
+FORMAT = "spinel-port-contract"
+REPORT_FORMAT = "spinel-port-report"
+VERSION = 1
+
+class Unable < StandardError; end
+
+def unable(msg) = raise(Unable, msg)
+
+def tool(env, name)
+  return ENV[env] if ENV[env] && !ENV[env].empty?
+  pre = ENV["LLVM_PREFIX"]
+  return File.join(pre, "bin", name) if pre && File.executable?(File.join(pre, "bin", name))
+  ENV.fetch("PATH", "").split(File::PATH_SEPARATOR).each do |d|
+    p = File.join(d, name)
+    return p if File.executable?(p)
+  end
+  unable("no #{name}: set #{env} or LLVM_PREFIX")
+end
+
+def run(*cmd)
+  out, err, st = Open3.capture3(*cmd)
+  unable("#{File.basename(cmd.first)} failed (#{st.exitstatus}): #{err.strip.lines.first(5).join.strip}") unless st.success?
+  out
+rescue Errno::ENOENT
+  unable("cannot run #{cmd.first}")
+end
+
+# ---- the contract -----------------------------------------------------------
+
+Part = Struct.new(:name, :group, :ambient, :closed, :image, :files, keyword_init: true)
+Entry = Struct.new(:capability, :kind, :name, :from, :to, :optional, :applies, keyword_init: true)
+
+class Contract
+  attr_reader :path, :tiers, :archs, :parts, :capabilities, :entries
+
+  def initialize(path)
+    @path = path
+    doc = begin
+      text = File.read(path)
+      unique_keys(YAML.parse(text))
+      YAML.safe_load(text, aliases: false)
+    rescue Psych::Exception => e
+      unable("#{path}: #{e.message}")
+    end
+    bad("not a mapping") unless doc.is_a?(Hash)
+    extra = doc.keys - %w[format version tiers archs parts capabilities]
+    bad("unknown key #{extra.first}") unless extra.empty?
+    bad("format must be #{FORMAT}") unless doc["format"] == FORMAT
+    bad("version must be #{VERSION}") unless doc["version"] == VERSION
+    @tiers = list(doc["tiers"], "tiers")
+    @archs = list(doc["archs"], "archs")
+    read_parts(doc["parts"])
+    read_capabilities(doc["capabilities"])
+  end
+
+  def bad(msg) = unable("#{@path}: #{msg}")
+
+  # YAML keeps the last of two equal keys without a word; a ledger must not.
+  def unique_keys(node)
+    return unless node
+    if node.is_a?(Psych::Nodes::Mapping)
+      keys = node.children.each_slice(2).map { |k, _| k.respond_to?(:value) ? k.value : nil }.compact
+      twice = keys.find { |k| keys.count(k) > 1 }
+      bad("line #{node.start_line + 1}: key #{twice} is given twice") if twice
+    end
+    node.children&.each { |c| unique_keys(c) } if node.respond_to?(:children)
+  end
+
+  def list(v, what)
+    bad("#{what} must be a non-empty list of names") unless v.is_a?(Array) && !v.empty? && v.all?(String)
+    bad("#{what} repeats a name") unless v.uniq.size == v.size
+    v
+  end
+
+  def flag(a, key, where)
+    v = a.fetch(key, false)
+    bad("#{where}: #{key} must be true or false") unless [true, false].include?(v)
+    v
+  end
+
+  def read_parts(h)
+    bad("parts must be a mapping") unless h.is_a?(Hash) && !h.empty?
+    @parts = {}
+    h.each do |name, a|
+      a ||= {}
+      bad("part #{name}: not a mapping") unless a.is_a?(Hash)
+      extra = a.keys - %w[group ambient surface image]
+      bad("part #{name}: unknown key #{extra.first}") unless extra.empty?
+      surface = a["surface"]
+      bad("part #{name}: surface, when given, must be closed") unless surface.nil? || surface == "closed"
+      bad("part #{name}: group must be a name") unless a["group"].nil? || a["group"].is_a?(String)
+      part = Part.new(name: name, group: a["group"], ambient: flag(a, "ambient", "part #{name}"),
+                      closed: surface == "closed", image: flag(a, "image", "part #{name}"), files: [])
+      bad("part #{name}: the image's own part takes no other key") if part.image && a.size > 1
+      bad("part #{name}: an ambient part has no closed surface") if part.ambient && part.closed
+      @parts[name] = part
+    end
+    bad("at most one part may be the image's own") if @parts.values.count(&:image) > 1
+    groups = @parts.values.filter_map(&:group)
+    clash = groups.find { |g| @parts.key?(g) }
+    bad("group #{clash} has the name of a part") if clash
+  end
+
+  def members(name) = @parts.key?(name) ? [name] : @parts.values.select { |p| p.group == name }.map(&:name)
+
+  def read_capabilities(h)
+    bad("capabilities must be a mapping") unless h.is_a?(Hash) && !h.empty?
+    @capabilities = {}
+    @entries = []
+    h.each do |cap, a|
+      bad("capability #{cap}: not a mapping") unless a.is_a?(Hash)
+      extra = a.keys - %w[tier arch symbols sections]
+      bad("capability #{cap}: unknown key #{extra.first}") unless extra.empty?
+      bad("capability #{cap}: tier must be one of #{@tiers.join(', ')}") unless @tiers.include?(a["tier"])
+      arch = a["arch"]
+      unless arch == "all" || (arch.is_a?(Array) && !arch.empty? && (arch - @archs).empty?)
+        bad("capability #{cap}: arch must be all or a list from #{@archs.join(', ')}")
+      end
+      @capabilities[cap] = { tier: a["tier"], arch: arch }
+      %w[symbols sections].each do |kind|
+        rows = a.fetch(kind, [])
+        bad("capability #{cap}: #{kind} must be a list") unless rows.is_a?(Array)
+        rows.each { |row| read_row(cap, kind == "symbols" ? :symbol : :section, row) }
+      end
+      bad("capability #{cap}: names nothing") if @entries.none? { |e| e.capability == cap }
+    end
+    %i[symbol section].each do |kind|
+      names = @entries.select { |e| e.kind == kind }.map(&:name)
+      twice = names.find { |n| names.count(n) > 1 }
+      bad("#{kind} #{twice} is named more than once") if twice
+    end
+  end
+
+  def read_row(cap, kind, row)
+    where = "capability #{cap}"
+    bad("#{where}: a row must be a mapping with from, to and names") unless row.is_a?(Hash)
+    extra = row.keys - %w[from to names optional]
+    bad("#{where}: unknown key #{extra.first}") unless extra.empty?
+    from = row["from"]
+    bad("#{where}: from must be a part, got #{from.inspect}") unless @parts.key?(from)
+    bad("#{where}: an ambient part (#{from}) needs no contract to be used") if @parts[from].ambient
+    to = row["to"]
+    bad("#{where}: to must be a non-empty list") unless to.is_a?(Array) && !to.empty?
+    users = to.flat_map do |t|
+      m = members(t)
+      bad("#{where}: to names #{t.inspect}, which is neither a part nor a group") if m.empty?
+      m
+    end
+    bad("#{where}: #{from} supplies to itself") if users.include?(from)
+    names = row["names"]
+    bad("#{where}: names must be a non-empty list") unless names.is_a?(Array) && !names.empty? && names.all?(String)
+    names.each do |n|
+      @entries << Entry.new(capability: cap, kind: kind, name: n, from: from, to: users.uniq,
+                            optional: flag(row, "optional", where))
+    end
+  end
+
+  # Which capabilities this build is held to.
+  def select(arch, tier)
+    unable("--arch #{arch}: the contract knows #{@archs.join(', ')}") unless @archs.include?(arch)
+    unable("--tier #{tier}: the contract knows #{@tiers.join(', ')}") unless @tiers.include?(tier)
+    level = @tiers.index(tier)
+    @capabilities.each_value do |c|
+      c[:applies] = @tiers.index(c[:tier]) <= level && (c[:arch] == "all" || c[:arch].include?(arch))
+    end
+    @entries.each { |e| e.applies = @capabilities[e.capability][:applies] }
+  end
+
+  def symbol(name) = (@symbols ||= @entries.select { |e| e.kind == :symbol }.to_h { |e| [e.name, e] })[name]
+  def sections = @entries.select { |e| e.kind == :section }
+end
+
+# ---- reading objects --------------------------------------------------------
+
+class Reader
+  def initialize
+    @nm = tool("NM", "llvm-nm")
+    @readobj = tool("READOBJ", "llvm-readobj")
+    @readelf = tool("READELF", "llvm-readelf")
+  end
+
+  def version = run(@readobj, "--version").lines.grep(/version/i).first.to_s.strip
+
+  def archive?(file) = File.binread(file, 8) == "!<arch>\n"
+
+  # `name type value` of llvm-nm --format=posix; an archive adds member
+  # headers and blank lines, which have no type column.
+  def nm(file, *opts)
+    run(@nm, "--format=posix", *opts, file).each_line.filter_map do |l|
+      f = l.split
+      [f[0], f[1], f[2]] if f.size >= 2 && f[1].size == 1
+    end
+  end
+
+  def exported(file) = nm(file, "--defined-only", "--extern-only").map(&:first).to_set
+  def undefined(file) = nm(file, "--undefined-only").map(&:first).to_set
+
+  # { member => { name => true when the member defines it for other files,
+  # false when it is the member's own (static) } }; the member is "" for an
+  # object file. A hidden symbol is among the true ones: it is local in the
+  # image and global to the link.
+  def symbols_by_member(file)
+    by = Hash.new { |h, k| h[k] = {} }
+    member = ""
+    archive = archive?(file)
+    run(@nm, "--format=posix", "--defined-only", file).each_line do |l|
+      f = l.split
+      if f.size >= 2 && f[1].size == 1 then by[member][f[0]] ||= f[1] =~ /[A-Z]/ ? true : false
+      elsif archive && (m = l.match(/\A(?:.*\[)?([^\[\]]+?)\]?:\s*\z/)) then member = m[1]
+      end
+    end
+    by
+  end
+
+  # every symbol the image defines, of any binding: { name => [addresses] }
+  def defined_in(image)
+    at = Hash.new { |h, k| h[k] = [] }
+    nm(image, "--defined-only").each { |name, _, value| at[name] << (value.to_i(16) & ~1) }
+    at
+  end
+
+  def globals(image)
+    nm(image, "--defined-only", "--extern-only").to_h { |name, _, value| [name, value.to_i(16) & ~1] }
+  end
+
+  def section_names(file)
+    run(@readelf, "-S", "--wide", file).each_line.filter_map { |l| l[/^\s*\[\s*\d+\]\s+(\S+)\s/, 1] }.to_set
+  end
+
+  # { output section => [address, size] }
+  def layout(image)
+    run(@readelf, "-S", "--wide", image).each_line.filter_map do |l|
+      m = l.match(/^\s*\[\s*\d+\]\s+(\S+)\s+\S+\s+(\h+)\s+\h+\s+(\h+)\s/)
+      [m[1], [m[2].to_i(16), m[3].to_i(16)]] if m
+    end.to_h
+  end
+
+  def entry_address(image)
+    m = run(@readelf, "-h", image).match(/Entry point address:\s+0x(\h+)/)
+    m ? m[1].to_i(16) : unable("#{image}: no entry point address")
+  end
+
+  # { member => { section => Set of the symbol names its relocations use } };
+  # the member is "" for an object file.
+  def references(file)
+    refs = Hash.new { |h, k| h[k] = Hash.new { |g, j| g[j] = Set.new } }
+    member = ""
+    section = nil
+    run(@readobj, "-r", file).each_line do |l|
+      if (m = l.match(/^File: (.*)$/))
+        member = m[1].end_with?(")") ? m[1][/\(([^()]*)\)\z/, 1] : ""
+      elsif (m = l.match(/^\s*Section \(\d+\) \.rela?(\..*) \{\s*$/))
+        section = m[1]
+      elsif section && (m = l.match(/^\s*0x\h+\s+\S+\s+(\S+)/))
+        refs[member][section] << m[1]
+      end
+    end
+    refs
+  end
+
+  # The linker's map: the input sections it kept, the symbols with the file
+  # each is in, and the names the script's own lines assign.
+  LinkMap = Struct.new(:kept, :symbols, :script, :outputs)
+
+  def link_map(file)
+    map = LinkMap.new([], Hash.new { |h, k| h[k] = [] }, Set.new, {})
+    current = nil
+    lines = File.readlines(file)
+    unable("#{file}: not an ld.lld map") unless lines.first.to_s =~ /\A\s*VMA\s+LMA\s+Size\s+Align\s+Out\s+In\s+Symbol/
+    lines.drop(1).each do |l|
+      m = l.chomp.match(/\A\s*(\h+)\s+\h+\s+(\h+)\s+\d+ (.*)\z/) or next
+      addr = m[1].to_i(16)
+      size = m[2].to_i(16)
+      rest = m[3]
+      if rest.start_with?(" " * 16)
+        map.symbols[rest.strip] << [addr & ~1, current[0], current[1]] if current
+      elsif rest.start_with?(" " * 8) && (i = rest.strip.match(/\A(.*?)(?:\(([^()]+)\))?:\(([^()]*)\)\z/))
+        current = i[1].start_with?("<") ? nil : [i[1], i[2] || "", i[3], size]
+        map.kept << current if current
+      else
+        current = nil
+        a = rest.strip.match(/\A(?:(?:PROVIDE|HIDDEN|PROVIDE_HIDDEN)\s*\(\s*)?([A-Za-z_][\w.$]*)\s*[-+*\/|&]?=(?!=)/)
+        map.script << a[1] if a
+        map.outputs[rest] = [addr, size] if rest =~ /\A\S+\z/
+      end
+    end
+    map
+  end
+end
+
+# ---- the check --------------------------------------------------------------
+
+class Check
+  attr_reader :refusals
+
+  def initialize(contract, reader, image, map)
+    @c = contract
+    @r = reader
+    @image = image
+    @map_file = map
+    @refusals = []
+    @parts = contract.parts.values.reject(&:image)
+    @own = contract.parts.values.find(&:image) # the link script's part, if the contract has one
+  end
+
+  def refuse(kind, msg) = @refusals << "#{kind}: #{msg}"
+
+  # The part a file of the map belongs to. The map spells a path as the link
+  # line did; a relative one is read from the map's own directory.
+  def given(path)
+    @given ||= @parts.flat_map { |p| p.files.map { |f| [File.realpath(f), [p.name, f]] } }.to_h
+    @given[File.realpath(File.expand_path(path, File.dirname(@map_file)))]
+  rescue Errno::ENOENT
+    nil
+  end
+
+  def part_of(path) = given(path)&.first
+  def file_of(path) = given(path)&.last
+
+  def measure
+    @defs = @parts.to_h { |p| [p.name, p.files.map { |f| @r.exported(f) }.reduce(Set.new, :|)] }
+    @map = @r.link_map(@map_file)
+
+    @map.kept.map(&:first).uniq.each do |path|
+      refuse("unlisted", "the image links #{path}, which was given to no part") unless part_of(path)
+    end
+
+    return if (@unlisted = !@refusals.empty?) # what follows would read the wrong files
+
+    @globals = @r.globals(@image)
+    @in_image = @r.defined_in(@image)
+    stale = @globals.count do |name, addr|
+      places = @map.symbols.fetch(name, []).select { |_, path, _| part_of(path) }
+      places.any? && places.none? { |a, _, _| a == addr }
+    end
+    unable("#{@map_file} is not the map of #{@image}: #{stale} symbols are at other addresses") if stale.positive?
+    layout = @r.layout(@image)
+    @map.outputs.each do |name, at|
+      next if !layout.key?(name) || layout[name] == at
+      unable("#{@map_file} is not the map of #{@image}: section #{name} is elsewhere or of another size")
+    end
+
+    @crossings = Set.new
+    refs = {}
+    @map.kept.each do |path, member, section, _|
+      user = part_of(path) or next
+      refs[path] ||= @r.references(file_of(path))
+      refs[path][member][section].each do |name|
+        own = symbols(path)[member][name]
+        next if own == false # the file's own static
+        supplier = definer(name)
+        next if supplier.nil? && own # the file's own global, hidden or dropped from the map
+        if supplier then @crossings << [user, supplier, name] unless supplier == user
+        elsif !@in_image.key?(name) then next # a weak reference nothing answers
+        elsif @own && @map.script.include?(name) then @crossings << [user, @own.name, name]
+        else
+          e = @c.symbol(name)
+          next if e && e.applies && !e.optional && e.from == @own&.name # reported as missing
+          refuse("unresolved", "#{user} uses #{name}, which only the linker's own default answers: " \
+                               "no part and no line of the link script defines it")
+        end
+      end
+    end
+
+    return unless @own
+    addr = @r.entry_address(@image) & ~1
+    @entry = @globals.select { |name, a| a == addr && definer(name) }.keys.sort
+    if @entry.empty? then refuse("unresolved", "the image's entry point is no global symbol of a part")
+    else @entry.each { |name| @crossings << [@own.name, definer(name), name] }
+    end
+  end
+
+  # The part whose definition of a name is the one in the image: the file
+  # the map places the symbol in, when that file defines it for others. nil
+  # when no part's file does.
+  def definer(name)
+    @definer ||= {}
+    return @definer[name] if @definer.key?(name)
+    place = @map.symbols.fetch(name, []).find { |_, path, member| part_of(path) && symbols(path)[member][name] }
+    @definer[name] = place && part_of(place[1])
+  end
+
+  def symbols(path) = (@symbols ||= {})[path] ||= @r.symbols_by_member(file_of(path))
+
+  def exempt?(user, supplier)
+    u = @c.parts[user]
+    s = @c.parts[supplier]
+    u.group && u.group == s.group
+  end
+
+  def allowed(user, supplier, sym)
+    e = @c.symbol(sym)
+    if e.nil? then "the contract does not name it"
+    elsif e.from != supplier then "the contract (#{e.capability}) has it from #{e.from}"
+    elsif !e.applies then "capability #{e.capability} does not apply to this architecture and tier"
+    elsif !e.to.include?(user) then "the contract (#{e.capability}) gives it to #{e.to.join(', ')} only"
+    end
+  end
+
+  def run
+    measure
+    return false if @unlisted
+    @used = Hash.new { |h, k| h[k] = Set.new }
+    @ambient = Hash.new { |h, k| h[k] = Hash.new { |g, j| g[j] = Set.new } }
+    @crossings.each do |user, supplier, sym|
+      if @c.parts[supplier].ambient
+        @ambient[supplier][user] << sym
+      elsif !exempt?(user, supplier)
+        why = allowed(user, supplier, sym)
+        if why then refuse("undeclared", "#{user} uses #{sym} from #{supplier}; #{why}")
+        else @used[sym] << user
+        end
+      end
+    end
+
+    @c.entries.select { |e| e.kind == :symbol && e.applies && !e.optional }.each do |e|
+      if e.from == @own&.name
+        next if @in_image.key?(e.name) && @map.script.include?(e.name) && !definer(e.name)
+        by = definer(e.name)
+        refuse("missing", "no line of the link script defines #{e.name} (#{e.capability})" +
+                          (by ? "; the image's is #{by}'s" : ""))
+      elsif !@defs[e.from].include?(e.name)
+        refuse("missing", "#{e.from} does not define #{e.name} (#{e.capability})")
+      elsif @in_image.key?(e.name) && definer(e.name) != e.from
+        refuse("missing", "#{e.name} (#{e.capability}) is to come from #{e.from}, but the image's is " \
+                          "#{definer(e.name) || 'the link script'}'s")
+      end
+    end
+
+    # A closed surface is held in every program, not only this one: all the
+    # part's files define and all they leave undefined.
+    free = @parts.select(&:ambient).map { |p| @defs[p.name] }.reduce(Set.new, :|)
+    @parts.select(&:closed).each do |p|
+      @defs[p.name].each do |s|
+        e = @c.symbol(s)
+        refuse("stray", "#{p.name} exports #{s}; the contract names no such symbol from #{p.name}") unless e && e.from == p.name
+      end
+      (p.files.map { |f| @r.undefined(f) }.reduce(Set.new, :|) - @defs[p.name] - free).each do |s|
+        e = @c.symbol(s)
+        next if e && e.to.include?(p.name) && e.applies
+        why = if e.nil? then "the contract does not name it"
+              elsif !e.applies then "capability #{e.capability} does not apply to this architecture and tier"
+              else "the contract (#{e.capability}) gives it to #{e.to.join(', ')} only"
+              end
+        refuse("undeclared", "#{p.name} refers to #{s}; #{why}")
+      end
+    end
+
+    @sections = {}
+    @c.sections.select(&:applies).each do |e|
+      kept = @map.kept.select { |path, _, section, _| section == e.name && part_of(path) == e.from }
+      has = kept.any? || @c.parts[e.from].files.any? { |f| @r.section_names(f).include?(e.name) }
+      @sections[e.name] = { supplied: kept.any?, image_bytes: kept.sum { |k| k[3] } }
+      next if kept.any? || (e.optional && !has)
+      refuse("missing", has ? "the image does not keep #{e.from}'s section #{e.name} (#{e.capability})"
+                            : "#{e.from} has no section #{e.name} (#{e.capability})")
+    end
+    @refusals.sort!
+    @refusals.uniq!
+    @refusals.empty?
+  end
+
+  def sha(file) = Digest::SHA256.file(file).hexdigest
+  def named(file) = { "file" => File.basename(file), "sha256" => sha(file) }
+
+  def supplied?(e)
+    return @in_image.key?(e.name) && @map.script.include?(e.name) && !definer(e.name) if e.from == @own&.name
+    @defs[e.from].include?(e.name)
+  end
+
+  def report(arch, tier, revision)
+    caps = @c.capabilities.to_h do |name, c|
+      rows = @c.entries.select { |e| e.capability == name }
+      body = { "tier" => c[:tier], "arch" => c[:arch], "applies" => c[:applies] }
+      if c[:applies]
+        body["symbols"] = rows.select { |e| e.kind == :symbol }.map do |e|
+          { "name" => e.name, "from" => e.from, "to" => e.to, "optional" => e.optional, "supplied" => supplied?(e),
+            "used_by" => @used[e.name].sort, "in_image" => @in_image.key?(e.name) }
+        end
+        secs = rows.select { |e| e.kind == :section }.map do |e|
+          { "name" => e.name, "from" => e.from, "to" => e.to, "optional" => e.optional,
+            "supplied" => @sections[e.name][:supplied], "image_bytes" => @sections[e.name][:image_bytes] }
+        end
+        body["sections"] = secs unless secs.empty?
+      end
+      [name, body]
+    end
+    twice = @in_image.keys.select { |s| @parts.count { |p| @defs[p.name].include?(s) } > 1 }.sort
+    {
+      "format" => REPORT_FORMAT, "version" => VERSION, "verdict" => "accepted",
+      "arch" => arch, "tier" => tier, "revision" => revision,
+      "inputs" => {
+        "contract" => named(@c.path),
+        "image" => named(@image).merge("entry" => @entry || []),
+        "map" => named(@map_file),
+        "parts" => @parts.to_h { |p| [p.name, p.files.map { |f| named(f) }] },
+      },
+      "tools" => { "reader" => @r.version },
+      "capabilities" => caps,
+      # symbols of the parts the contract leaves free to use, by supplier and user
+      "ambient" => @ambient.sort.to_h { |s, by| [s, by.sort.to_h { |u, set| [u, set.sort] }] },
+      # a global more than one part defines: whose copy the image has
+      "shadowed" => twice.to_h do |s|
+        [s, { "defined_by" => definer(s),
+              "also_in" => @parts.select { |p| @defs[p.name].include?(s) }.map(&:name).reject { |n| n == definer(s) } }]
+      end,
+    }
+  end
+end
+
+# ---- command line -----------------------------------------------------------
+
+def main(argv)
+  opt = { parts: [] }
+  until argv.empty?
+    a = argv.shift
+    case a
+    when "--contract", "--arch", "--tier", "--image", "--map", "--report", "--revision"
+      v = argv.shift or unable("#{a} takes a value")
+      opt[a[2..].to_sym] = v
+    when "--list" then opt[:list] = true
+    when "--part"
+      v = argv.shift or unable("--part takes NAME=FILE")
+      name, file = v.split("=", 2)
+      unable("--part takes NAME=FILE, got #{v}") if file.nil? || file.empty?
+      opt[:parts] << [name, file]
+    else unable("unknown argument #{a}")
+    end
+  end
+  if opt[:list]
+    unable("--contract is required") unless opt[:contract]
+    unable("no such file: #{opt[:contract]}") unless File.file?(opt[:contract])
+    c = Contract.new(opt[:contract])
+    c.entries.each do |e|
+      cap = c.capabilities[e.capability]
+      puts [e.capability, cap[:tier], Array(cap[:arch]).join(","), e.kind, e.name, e.from, e.to.join(","),
+            e.optional ? "optional" : "required"].join("\t")
+    end
+    return 0
+  end
+  %i[contract arch tier image map].each { |k| unable("--#{k} is required") unless opt[k] }
+  [opt[:contract], opt[:image], opt[:map], *opt[:parts].map(&:last)].each { |f| unable("no such file: #{f}") unless File.file?(f) }
+
+  contract = Contract.new(opt[:contract])
+  contract.select(opt[:arch], opt[:tier])
+  reader = Reader.new
+  opt[:parts].each do |name, file|
+    part = contract.parts[name]
+    unable("--part #{name}: the contract's parts are #{contract.parts.keys.join(', ')}") unless part
+    unable("--part #{name}: that part is what the image defines itself; give --image") if part.image
+    part.files << File.expand_path(file)
+  end
+  files = contract.parts.values.flat_map { |p| p.files.map { |f| File.realpath(f) } }
+  twice = files.find { |f| files.count(f) > 1 }
+  unable("#{twice} is given more than once") if twice
+  contract.parts.each_value do |p|
+    unable("no file given for part #{p.name}") if !p.image && p.files.empty?
+  end
+  if opt[:report]
+    inputs = [opt[:contract], opt[:image], opt[:map], *opt[:parts].map(&:last)]
+    same = inputs.find { |f| File.expand_path(f) == File.expand_path(opt[:report]) }
+    unable("--report names an input: #{same}") if same
+    # a report of an earlier run must not outlive a refusal of this one
+    File.delete(opt[:report]) if File.file?(opt[:report])
+  end
+
+  check = Check.new(contract, reader, File.expand_path(opt[:image]), File.expand_path(opt[:map]))
+  if check.run
+    if opt[:report]
+      tmp = "#{opt[:report]}.tmp#{$$}"
+      File.write(tmp, JSON.pretty_generate(check.report(opt[:arch], opt[:tier], opt[:revision])) + "\n")
+      File.rename(tmp, opt[:report])
+    end
+    puts "#{PROG}: accepted (#{opt[:arch]}, #{opt[:tier]})"
+    0
+  else
+    check.refusals.each { |r| warn "#{PROG}: refused: #{r}" }
+    warn "#{PROG}: refused (#{check.refusals.size})"
+    1
+  end
+end
+
+begin
+  exit main(ARGV.dup)
+rescue Unable => e
+  warn "#{PROG}: #{e.message}"
+  exit 2
+end

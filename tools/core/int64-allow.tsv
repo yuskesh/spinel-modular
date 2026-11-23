@@ -1,0 +1,29 @@
+# tools/core/int64-allow.tsv -- the sources that keep `# spinel: int64` on a
+# 32-bit target.
+#
+# On a target whose pointers are 32 bits, the kernel (spinel-core-kernel)
+# and spinel-fs-emit refuse a first-line
+# `# spinel: int64` unless this table lists the source. A listed source builds
+# at 64 bits as before. A source is listed when its bytes are a listed file's
+# current bytes, so a lane that compiles a copy is still listed and an edited
+# copy is not. `--int64-allow FILE` reads another table; a table's paths are
+# relative to the directory two levels above its own (tools/core/ -> the
+# repository).
+#
+# Every read checks the whole table: a row that is not a path and a reason, a
+# path listed twice, a path that does not exist, or a listed file that does
+# not declare `# spinel: int64` refuses every source (`int64-allow-table`).
+#
+# A row is a deliberate exception: a source whose 64-bit Integer does not matter for
+# performance, typically a test whose subject is 64-bit arithmetic or a 64-bit
+# platform value, and only where rewriting it at 32 bits would lose what it
+# tests.
+#
+# COLUMNS
+#   path    the source, from the repository root
+#   reason  why its 64 bits stay, and why a rewrite would lose the test
+#
+#path	reason
+tests/freestanding/externs/externs_kern.rb	the externs lane checks Zephyr's 64-bit platform values, uptime_ms -> i64 and print_i64(i64), and the i64 extern-argument and return boundaries; at 32 bits those externs cannot be called, and the platform contract stays as it is (owner, 2026-10-21)
+tests/freestanding/externs/reject/c1_ok.rb	the externs lane's accepted control for the same surface: an i64 return built from uptime_ms()'s i64 value
+tests/freestanding/externs/reject/c3_wrap_narrow.rb	the externs lane's accepted control for a wrap entry narrowing an i64 argument to gpio_set's i32 pin

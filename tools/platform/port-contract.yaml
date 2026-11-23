@@ -1,0 +1,192 @@
+# tools/platform/port-contract.yaml -- the port contract: every symbol and
+# section that crosses between the parts of a bare-metal build, named once.
+# (The guide is docs/platform/port-contract.md, the design
+# docs/platform/port-contract-design.md.)
+#
+# tools/platform/port-check holds a build to this file and has no symbol,
+# section or part name of its own. Adding to the agreement between the runtime
+# and a port edits THIS FILE, nothing else.
+#
+# A build is made of PARTS. A row under a capability says which part supplies
+# the names (`from`) and which parts may use them (`to`: parts or groups). A
+# use the rows do not allow is refused, a required name its supplier does not
+# define is refused, and so is a global a `surface: closed` part defines
+# without a row here.
+#
+# The sections named here are the ones a part must hand the link script by
+# name. Which other sections a part has is not held.
+#
+#   * `tier` is the lowest tier whose builds need the capability
+#     (core < arena < full, the lattice of menus.yaml). Every capability
+#     here is "full": tools/bare-full builds full-tier programs only. A build
+#     of a lower tier is not held to the capability and may not use it.
+#   * `arch` is `all` or the architectures the capability exists on. Elsewhere
+#     its names may be neither used nor required.
+#   * `optional: true`: the supplier may leave the names out. Users must
+#     then cope (a weak reference).
+#   * A required name must be DEFINED by its supplier whether or not this
+#     program uses it. That is what makes the answer the same for every
+#     program, and what catches a link script without the init array bounds:
+#     the C library's references to those are weak, so the link succeeds and
+#     the constructors silently do not run.
+#   * Several rows say "the answer may be: not here". The name must exist; the
+#     port may answer ENOSYS (or what the comment says). The runtime keeps the
+#     call reachable, so the symbol crosses even where there is no file,
+#     socket or second stack.
+#
+# The names are the ones tools/bare-full, the bare-metal build this contract
+# holds (docs/platform/port-contract.md), uses; the `bf_` prefix is its own.
+
+format: spinel-port-contract
+version: 1
+
+tiers: [core, arena, full]        # as menus.yaml; tests/port-contract/run.sh holds the two equal
+archs: [armv6-m, armv8-m.main]    # Cortex-M0+ ; Cortex-M33
+
+# `group`            parts of one group use each other freely.
+# `ambient: true`    any part may use it without a row here (it still needs
+#                    rows for what IT asks of the port).
+# `surface: closed`  every global the part defines must be a row's name, and
+#                    every symbol its files leave undefined must be a row's
+#                    name given to it (or an ambient part's). Held in all of
+#                    the part's files, whatever this program uses.
+# `image: true`      not files: what a line of the link script defines.
+parts:
+  program:  { group: hosted }                  # the compiled Ruby program
+  runtime:  { group: hosted }                  # the Spinel runtime archive
+  libc:     { ambient: true }                  # the C library (picolibc)
+  builtins: { ambient: true }                  # compiler-rt's builtins
+  base:     {}                                 # the port's common code (reset, POSIX surface)
+  chip:     { surface: closed }                # chip family and board code
+  link:     { image: true }                    # the link script
+
+capabilities:
+  start:                          # reset to the program's first line
+    tier: full
+    arch: all
+    symbols:
+      - { from: base, to: [link], names: [Reset_Handler] }   # the image's entry
+      - { from: link, to: [base], names: [__bss_start, __bss_end, __stack_top] }
+      # .data's load address and run-time bounds. The base copies it at reset.
+      # Nothing else may read them: a program that wants the end of the image
+      # in flash reads __image_end (capability `image`).
+      - { from: link, to: [base], names: [__data_load, __data_start, __data_end] }
+      # one register write before any RAM is touched: {address, value} or {0, 0}
+      - { from: chip, to: [base], names: [bf_early_write] }
+      # the program's main, renamed by the build
+      - { from: program, to: [base], names: [sp_app_main] }
+    sections:
+      - { from: base, to: [link], names: [.vectors] }        # the vector table, kept and placed by the script
+      # a second-stage boot block the chip's ROM runs first (RP2040: 256 bytes
+      # with a CRC). Only some chips have one.
+      - { from: chip, to: [link], names: [.boot2], optional: true }
+
+  image:                          # where the image ends in the region it is loaded from
+    tier: full
+    arch: all
+    symbols:
+      # The load address one past the last byte of the image: the first free
+      # byte of flash on a board that runs from flash. The script defines it
+      # after whatever it loads last (today LOADADDR(.data) + SIZEOF(.data)),
+      # so that a program does not depend on how the script places .data.
+      - { from: link, to: [program], names: [__image_end] }
+
+  constructors:                   # the runtime registers its hooks in .init_array
+    tier: full
+    arch: all
+    symbols:
+      # the C library's references to these are weak: a script without them
+      # links, and the constructors silently do not run
+      - from: link
+        to: [libc]
+        names: [__bothinit_array_start, __bothinit_array_end, __fini_array_start, __fini_array_end]
+      # the runtime's part of the link script defines these too; no link of
+      # the three boards reads them (picolibc walks the "both" bounds)
+      - from: link
+        to: [libc]
+        optional: true
+        names: [__preinit_array_start, __preinit_array_end, __init_array_start, __init_array_end]
+
+  heap:                           # the C library's sbrk reads the bounds
+    tier: full
+    arch: all
+    symbols:
+      - { from: link, to: [libc], names: [__heap_start, __heap_end] }
+
+  console:                        # every descriptor is the board's console
+    tier: full
+    arch: all
+    symbols:
+      - { from: base, to: [hosted, libc], names: [write, read, isatty] }
+      - { from: chip, to: [base], names: [bf_console_init, bf_putc] }
+      - { from: base, to: [chip], names: [bf_puts, bf_putu, bf_putx] }
+
+  clock:                          # uptime, every clock id alike; sleep waits on it
+    tier: full
+    arch: all
+    symbols:
+      - { from: base, to: [hosted, libc], names: [clock_gettime, nanosleep] }
+      - { from: chip, to: [base], names: [bf_core_hz] }       # the rate SysTick counts
+      # microseconds from a counter that does not follow the core clock
+      - { from: chip, to: [base], names: [bf_board_us], optional: true }
+
+  exit:                           # the end of the program and its report lines
+    tier: full
+    arch: all
+    symbols:
+      - { from: base, to: [libc], names: [_exit] }
+      - { from: runtime, to: [base], names: [sp_gc_stat_collections] }
+      - { from: chip, to: [base], names: [bf_board_report] }  # the chip's own lines after BEGIN, or nothing
+
+  environment:                    # the runtime's settings; shadows the C library's getenv
+    tier: full
+    arch: all
+    symbols:
+      - { from: base, to: [hosted, libc], names: [getenv] }
+
+  files:                          # the answer may be: not here
+    tier: full
+    arch: all
+    symbols:
+      - { from: base, to: [hosted, libc], names: [open, close, lseek, stat, fstat, lstat] }
+
+  sockets:                        # the answer may be: not here
+    tier: full
+    arch: all
+    symbols:
+      - { from: base, to: [hosted, libc], names: [send, getsockopt, fcntl, poll] }
+
+  contexts:                       # fibers' second stacks; the answer may be: not here
+    tier: full
+    arch: all
+    symbols:
+      - { from: base, to: [hosted], names: [getcontext, setcontext, swapcontext, makecontext] }
+
+  signals:                        # the answer may be: accepted and never delivered
+    tier: full
+    arch: all
+    symbols:
+      - { from: base, to: [hosted], names: [sigaction] }
+
+  mappings:                       # the answer may be: a failed mapping
+    tier: full
+    arch: all
+    symbols:
+      - { from: base, to: [hosted], names: [mmap, munmap, mprotect, madvise] }
+
+  atomics:                        # ARMv6-M has no exclusive load and store: the
+    tier: full                    # compiler calls these, and the builtins leave them out
+    arch: [armv6-m]
+    symbols:
+      - from: base
+        to: [hosted, libc]
+        names: [__atomic_load_1, __atomic_load_2, __atomic_load_4, __atomic_load_8,
+                __atomic_store_1, __atomic_store_2, __atomic_store_4, __atomic_store_8,
+                __atomic_exchange_1, __atomic_exchange_2, __atomic_exchange_4, __atomic_exchange_8,
+                __atomic_compare_exchange_1, __atomic_compare_exchange_2,
+                __atomic_compare_exchange_4, __atomic_compare_exchange_8,
+                __atomic_fetch_add_1, __atomic_fetch_add_2, __atomic_fetch_add_4, __atomic_fetch_add_8,
+                __atomic_fetch_sub_1, __atomic_fetch_sub_2, __atomic_fetch_sub_4, __atomic_fetch_sub_8,
+                __atomic_fetch_and_1, __atomic_fetch_and_2, __atomic_fetch_and_4, __atomic_fetch_and_8,
+                __atomic_fetch_or_1, __atomic_fetch_or_2, __atomic_fetch_or_4, __atomic_fetch_or_8,
+                __atomic_fetch_xor_1, __atomic_fetch_xor_2, __atomic_fetch_xor_4, __atomic_fetch_xor_8]

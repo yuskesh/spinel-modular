@@ -1,0 +1,14 @@
+# The MPS2+ with the AN521 image, as QEMU's mps2-an521 models it. Values only;
+# the code is the chip family's (chip/an521/).
+format: spinel-board
+version: 1
+chip: an521
+clock:
+  core_hz: 25000000
+console:
+  uart: 0
+  baud_divisor: 16
+policy:
+  gc_slab: 0
+  gc_threshold_kb: 16
+  stack_bytes: 65536

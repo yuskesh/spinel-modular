@@ -1,0 +1,33 @@
+# The macOS arm64 host profile: the 64-bit host leg on a Mac.  ints/run_wide.sh
+# and int-width/run.rb pick it on Darwin-arm64.
+#
+# The data layout is exactly the string clang emits for this triple, so a
+# kernel module agrees with C compiled by that clang when the two are linked
+# (llvm-link would only warn, and a wrong pointer size in a linked module is
+# silent).
+#
+# It is NOT a deployment profile: nothing ships a freestanding kernel to
+# macOS.  `platform: none` and `libc: none` are the honest values -- the test
+# driver supplies spinel_trap and nothing else.
+target:
+  triple: arm64-apple-macosx14.0.0
+  data_layout: "e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-n32:64-S128-Fn32"
+  cflags: [-O2]
+abi:
+  boundary: c-abi
+  int_width: i64-internal
+  overflow: trap
+  trap_hook: spinel_trap
+runtime:
+  libc: none
+  libm: none
+  compiler_rt: allow
+platform:
+  type: none
+  # Two spellings of ONE symbol.  Mach-O prefixes C identifiers with an
+  # underscore and the undefined-symbol gate compares the raw strings
+  # `llvm-nm -u` prints, so on this (host-only, non-deployment) profile the
+  # allowance has to name both.  Teaching the checker about object-file name
+  # mangling would change a shipping gate for the sake of a test rig, so the
+  # profile carries the cost instead.
+  externs: [spinel_trap, _spinel_trap]

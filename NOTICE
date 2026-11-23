@@ -1,0 +1,14 @@
+spinel-modular
+Copyright (c) 2026 Yusuke Shinozaki
+
+spinel-modular is licensed under Apache-2.0 WITH LLVM-exception. See LICENSE.
+This covers the files written here and the files ported from the copyright
+holder's earlier repositories, which stated no licence of their own.
+
+Files that keep another licence are listed in THIRD_PARTY.md, each with the
+licence text that covers it:
+- Spinel (https://github.com/matz/spinel), pinned as the git submodule
+  vendor/spinel: MIT License, Copyright (c) 2024- Yukihiro Matsumoto. Files
+  that reproduce Spinel code carry its LICENSE beside them.
+
+This is a summary and not legal advice.

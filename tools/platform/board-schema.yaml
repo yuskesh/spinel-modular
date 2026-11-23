@@ -1,0 +1,48 @@
+# tools/platform/board-schema.yaml -- what a board file and a chip family's
+# statement must look like, version 1.
+#
+# A BOARD FILE (board/<name>.yaml beside a port's code) holds values only: a
+# crystal frequency, a flash size, which UART the console is on. Its name is
+# the file's name. It says which chip family it is for, and the family's own
+# statement (chip/<family>/chip.yaml) says which keys a board of that family
+# gives and what each may be. tools/platform/board-check holds a board file to
+# both, and has no key, chip or board name of its own: a new board value is a
+# line in the family's chip.yaml, a new policy value a line here.
+#
+#   * Every value is an integer or a name. An integer is plain decimal with
+#     its unit in the key (_hz, _bytes, _kb): no K or M suffix, so that every
+#     reader of the file reads the same number.
+#   * A board names instances (UART 0, pin 1), never addresses. The table
+#     from an instance to its registers is the family's code.
+#   * `policy` is not the board's hardware: it is how much of it a program
+#     is given. The keys are the same for every chip, so they are stated
+#     here once; a board file carries its defaults.
+#
+# A chip family's statement may also say how a build of it is made, with two
+# optional keys that are not values and make no define:
+#
+#   * `objects`: a program in the family's directory that makes objects
+#     before the link (a boot block with a checksum, say).
+#   * `image`: `flash_origin` and `flash_bytes` say what the flash is, each
+#     as a number or as the name of one of the board's values (`chip.<path>`,
+#     `board.<path>`, `policy.<key>`); `uf2: {family_id: N}` asks for that
+#     format.
+#
+# Rules: {type: int, min:, max:, one_of: [...]} or {type: name, one_of:
+# [...]}; `optional: true` lets the key be absent.
+
+format: spinel-board-schema
+version: 1
+
+board:                            # the head of a board file
+  format: spinel-board
+  version: 1
+chip:                             # the head of a chip family's statement
+  format: spinel-chip
+  version: 1
+
+policy:
+  stack_bytes:     { type: int, min: 1024 }               # the reset stack, at the top of RAM
+  ram_bytes:       { type: int, min: 1024, optional: true }  # RAM used, when not all of the chip's
+  gc_threshold_kb: { type: int, min: 1 }                  # the collector's first collection
+  gc_slab:         { type: int, one_of: [0, 1] }          # the collector's slab arena, off or on

@@ -1,0 +1,17 @@
+core-contract 1
+root src/row_fill.rb
+entry row_fill
+result i64
+param scr buffer u8 inout count n_scr
+param n_scr scalar u64
+param tile buffer u8 in count n_tile
+param n_tile scalar u64
+param lut buffer u8 in count n_lut
+param n_lut scalar u64
+param y scalar i64
+param x0 scalar i64
+param x1 scalar i64
+param u scalar i64
+param du scalar i64
+param row scalar i64
+param width scalar i64

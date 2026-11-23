@@ -1,0 +1,18 @@
+# the statement of the control chip family of tests/port-contract/board.sh
+format: spinel-chip
+version: 1
+archs: [armv6-m]
+cpu: m0plus
+values:
+  flash: { origin: 0x10000000, size_bytes: 1048576, head_bytes: 16 }
+  ram: { origin: 0x20000000, size_bytes: 65536 }
+objects: boot/object.rb
+image:
+  flash_origin: chip.flash.origin
+  flash_bytes: chip.flash.size_bytes
+  uf2: { family_id: 0x12345678 }
+board:
+  clock.crystal_hz: { type: int, min: 1000000, max: 15000000 }
+  console.uart:     { type: int, one_of: [0, 1] }
+  console.baud:     { type: int, min: 300 }
+  flash.boot:       { type: name, one_of: [plain, quad], optional: true }

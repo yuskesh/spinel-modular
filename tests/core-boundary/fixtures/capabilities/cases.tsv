@@ -1,0 +1,71 @@
+# Scalar cases: an entry, its arguments and the answer it must give.
+#
+# Columns, tab-separated:
+#   id      unique; names the case in output
+#   entry   the entry under src/
+#   args    comma-separated arguments in order
+#   want    the answer, worked out by hand from the definition in the
+#           entry's source (no other implementation is run to produce it)
+#
+# The cases sit where an implementation could go wrong: the 32-bit limits and
+# the values one past them, negative operands where truncation and flooring
+# differ, a zero divisor, and the first quotient that no longer fits.
+#
+#id	entry	args	want
+wrap-zero	wrap_i32	0	0
+wrap-max	wrap_i32	2147483647	2147483647
+wrap-high-bit	wrap_i32	2147483648	-2147483648
+wrap-all-ones	wrap_i32	4294967295	-1
+wrap-one-turn	wrap_i32	4294967296	0
+wrap-one-turn-and-five	wrap_i32	4294967301	5
+wrap-min	wrap_i32	-2147483648	-2147483648
+wrap-below-min	wrap_i32	-2147483649	2147483647
+wrap-minus-one	wrap_i32	-1	-1
+mask-zero	mask_u32	0	0
+mask-one	mask_u32	1	1
+mask-high-bit	mask_u32	2147483648	2147483648
+mask-all-ones	mask_u32	4294967295	4294967295
+mask-one-turn	mask_u32	4294967296	0
+mask-one-turn-and-one	mask_u32	4294967297	1
+mask-two-turns-and-five	mask_u32	8589934597	5
+mask-minus-one	mask_u32	-1	4294967295
+mask-negative-half	mask_u32	-2147483648	2147483648
+mask-negative-turn	mask_u32	-4294967296	0
+div-positive	div_trunc	7,2	3
+div-negative-dividend	div_trunc	-7,2	-3
+div-negative-divisor	div_trunc	7,-2	-3
+div-both-negative	div_trunc	-7,-2	3
+div-exact	div_trunc	8,2	4
+div-zero-dividend	div_trunc	0,5	0
+div-small-positive	div_trunc	1,3	0
+div-small-negative	div_trunc	-1,3	0
+div-min	div_trunc	-2147483648,1	-2147483648
+div-min-negated	div_trunc	2147483647,-1	-2147483647
+mul-unit	q8_mul	256,256	256
+mul-negative	q8_mul	-256,256	-256
+mul-both-negative	q8_mul	-256,-256	256
+mul-half	q8_mul	128,256	128
+mul-fractions	q8_mul	384,512	768
+mul-underflows-to-zero	q8_mul	1,1	0
+mul-floors-negative	q8_mul	-1,1	-1
+mul-max-by-one	q8_mul	2147483647,256	2147483647
+mul-max-by-two	q8_mul	2147483647,512	-2
+mul-min-by-one	q8_mul	-2147483648,256	-2147483648
+mul-min-by-min	q8_mul	-2147483648,-2147483648	0
+mul-zero	q8_mul	0,-2147483648	0
+qdiv-unit	q8_div	256,256	256
+qdiv-fractions	q8_div	768,512	384
+qdiv-negative-dividend	q8_div	-768,512	-384
+qdiv-negative-divisor	q8_div	768,-512	-384
+qdiv-truncates-positive	q8_div	1,3	85
+qdiv-truncates-negative	q8_div	-1,3	-85
+qdiv-zero-divisor	q8_div	1,0	2147483647
+qdiv-zero-divisor-negative	q8_div	-1,0	-2147483648
+qdiv-zero-by-zero	q8_div	0,0	2147483647
+qdiv-last-that-fits	q8_div	8388607,1	2147483392
+qdiv-first-that-clamps	q8_div	8388608,1	2147483647
+qdiv-negative-limit	q8_div	-8388608,1	-2147483648
+qdiv-negative-inside	q8_div	-8388607,1	-2147483392
+qdiv-max-clamps	q8_div	2147483647,1	2147483647
+qdiv-min-clamps	q8_div	-2147483648,1	-2147483648
+qdiv-min-by-minus-one	q8_div	-2147483648,-1	2147483647

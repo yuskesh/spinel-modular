@@ -1,0 +1,300 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# tools/platform/board-check -- hold a board file to the schema and to its
+# chip family's statement.
+#
+# usage: board-check --schema SCHEMA --chip-dir DIR... [--contract CONTRACT]
+#                    [--values | --head] BOARD.yaml
+#
+# SCHEMA is tools/platform/board-schema.yaml. The board file names its chip
+# family; the family's statement is DIR/<family>/chip.yaml. --chip-dir may be
+# given several times: the statement is the first one found, in the order
+# given. With --contract, the family's architectures must be among the port
+# contract's.
+#
+# A board file is refused when its head is not the schema's, when it has a
+# key its family does not list (or the schema's policy does not), when a
+# listed key that is not optional is absent, or when a value is not of the
+# kind its rule says. The family's statement is held the same way. Both files
+# are read strictly: an unknown key or a key given twice is never passed over.
+#
+# --values prints, for a valid board, one `key<TAB>value` line per value:
+# `board.<path>` for the board's, `policy.<path>`, and `chip.<path>` for the
+# family's own values. A build that turns the files into defines can be
+# compared with it.
+#
+# --head prints one line for a valid board: its name, its chip family, the
+# family's core, the family's architectures and the family's directory, made
+# absolute (tab-separated; several architectures are joined by commas).
+#
+# An integer of a board file is written in plain decimal. YAML would also
+# read 0x10, 010 (as eight) and 1_000; a board file that spells a number so
+# is refused, because not every reader of the file reads those alike. A chip
+# family's own values may be written in hexadecimal: they are addresses.
+#
+# It holds no key, chip or board name of its own. Exit status: 0 valid,
+# 1 refused (one `board-check: refused: ...` line per reason), 2 the check
+# could not be made.
+
+require "yaml"
+
+PROG = "board-check"
+SCHEMA_FORMAT = "spinel-board-schema"
+VERSION = 1
+
+class Unable < StandardError; end
+
+def unable(msg) = raise(Unable, msg)
+
+# YAML keeps the last of two equal keys without a word.
+def unique_keys(node, path)
+  return unless node
+  if node.is_a?(Psych::Nodes::Mapping)
+    keys = node.children.each_slice(2).map { |k, _| k.respond_to?(:value) ? k.value : nil }.compact
+    twice = keys.find { |k| keys.count(k) > 1 }
+    unable("#{path}: line #{node.start_line + 1}: key #{twice} is given twice") if twice
+  end
+  node.children&.each { |c| unique_keys(c, path) } if node.respond_to?(:children)
+end
+
+# The plain scalars of a document that YAML reads as numbers though they are
+# not plain decimal integers.
+def odd_numbers(node, found = [])
+  return found unless node
+  if node.is_a?(Psych::Nodes::Scalar) && node.plain && !node.tag
+    v = node.value
+    found << v if v =~ /\A[-+]?(\d[\d_,]*|0[xXoObB][\h_]+)\z/ && v !~ /\A-?(0|[1-9]\d*)\z/
+  end
+  node.children&.each { |c| odd_numbers(c, found) } if node.respond_to?(:children)
+  found
+end
+
+def load(path, decimal: false, refusals: nil)
+  unable("no such file: #{path}") unless File.file?(path)
+  text = File.read(path)
+  tree = YAML.parse(text)
+  unique_keys(tree, path)
+  odd_numbers(tree).uniq.each { |v| refusals << "#{path}: #{v} is not a plain decimal integer" } if decimal
+  doc = YAML.safe_load(text, aliases: false)
+  unable("#{path}: not a mapping") unless doc.is_a?(Hash)
+  doc
+rescue Psych::Exception => e
+  unable("#{path}: #{e.message}")
+end
+
+NAME = /\A[A-Za-z][A-Za-z0-9_.-]*\z/
+
+# A rule of the schema or of a chip's statement, checked once when read.
+def rule(where, r)
+  unable("#{where}: a rule must be a mapping with a type") unless r.is_a?(Hash)
+  extra = r.keys - %w[type min max one_of optional]
+  unable("#{where}: unknown key #{extra.first}") unless extra.empty?
+  unable("#{where}: optional must be true or false") unless [nil, true, false].include?(r["optional"])
+  case r["type"]
+  when "int"
+    %w[min max].each { |k| unable("#{where}: #{k} must be an integer") unless r[k].nil? || r[k].is_a?(Integer) }
+    unable("#{where}: one_of must be a list of integers") unless r["one_of"].nil? || ints?(r["one_of"])
+  when "name"
+    unable("#{where}: a name takes no min or max") if r["min"] || r["max"]
+    ok = r["one_of"].is_a?(Array) && !r["one_of"].empty? && r["one_of"].all? { |v| v.is_a?(String) && v =~ NAME }
+    unable("#{where}: a name needs one_of, a list of names") unless ok
+  else unable("#{where}: type must be int or name")
+  end
+  r
+end
+
+def ints?(v) = v.is_a?(Array) && !v.empty? && v.all?(Integer)
+
+def rules(where, h)
+  unable("#{where} must be a mapping of keys to rules") unless h.is_a?(Hash)
+  h.to_h do |key, r|
+    unable("#{where}: #{key.inspect} is not a key path") unless key.is_a?(String) && key.split(".").all? { |p| p =~ /\A[a-z][a-z0-9_]*\z/ }
+    [key, rule("#{where}: #{key}", r)]
+  end
+end
+
+# { "a.b" => value } of a nested mapping; a value that is neither a mapping
+# nor a scalar is kept and refused by its rule.
+def flatten(h, prefix = nil)
+  h.each_with_object({}) do |(k, v), out|
+    path = [prefix, k].compact.join(".")
+    if v.is_a?(Hash) && !v.empty? then out.merge!(flatten(v, path))
+    else out[path] = v
+    end
+  end
+end
+
+def hold(what, values, rules, refusals)
+  values.each do |key, v|
+    r = rules[key]
+    next refusals << "#{what} has #{key}, which #{rules.empty? ? 'nothing' : 'no rule'} lists" unless r
+    case r["type"]
+    when "int"
+      next refusals << "#{what}: #{key} must be a plain integer, got #{v.inspect}" unless v.is_a?(Integer)
+      refusals << "#{what}: #{key} is #{v}, below #{r['min']}" if r["min"] && v < r["min"]
+      refusals << "#{what}: #{key} is #{v}, above #{r['max']}" if r["max"] && v > r["max"]
+      refusals << "#{what}: #{key} is #{v}, not one of #{r['one_of'].join(', ')}" if r["one_of"] && !r["one_of"].include?(v)
+    when "name"
+      refusals << "#{what}: #{key} is #{v.inspect}, not one of #{r['one_of'].join(', ')}" unless r["one_of"].include?(v)
+    end
+  end
+  rules.each do |key, r|
+    refusals << "#{what} lacks #{key}" unless r["optional"] || values.key?(key)
+  end
+end
+
+def head(path, doc, want, refusals)
+  want.each do |k, v|
+    refusals << "#{path}: #{k} must be #{v}, got #{doc[k].inspect}" unless doc[k] == v
+  end
+end
+
+def main(argv)
+  opt = {}
+  rest = []
+  until argv.empty?
+    a = argv.shift
+    case a
+    when "--schema", "--contract"
+      opt[a[2..].tr("-", "_").to_sym] = argv.shift or unable("#{a} takes a value")
+    when "--chip-dir"
+      (opt[:chip_dir] ||= []) << (argv.shift or unable("#{a} takes a value"))
+    when "--values" then opt[:values] = true
+    when "--head" then opt[:head] = true
+    when /\A--/ then unable("unknown argument #{a}")
+    else rest << a
+    end
+  end
+  unable("usage: #{PROG} --schema SCHEMA --chip-dir DIR... [--contract CONTRACT] [--values | --head] BOARD.yaml") unless
+    rest.size == 1 && opt[:schema] && opt[:chip_dir]
+  opt[:chip_dir].each { |d| unable("no such directory: #{d}") unless File.directory?(d) }
+
+  schema = load(opt[:schema])
+  extra = schema.keys - %w[format version board chip policy]
+  unable("#{opt[:schema]}: unknown key #{extra.first}") unless extra.empty?
+  unable("#{opt[:schema]}: format must be #{SCHEMA_FORMAT}, version #{VERSION}") unless
+    schema["format"] == SCHEMA_FORMAT && schema["version"] == VERSION
+  %w[board chip].each do |k|
+    unable("#{opt[:schema]}: #{k} must give a format and a version") unless
+      schema[k].is_a?(Hash) && schema[k].keys.sort == %w[format version]
+  end
+  policy_rules = rules("#{opt[:schema]}: policy", schema["policy"])
+
+  board_path = rest.first
+  refusals = []
+  board = load(board_path, decimal: true, refusals: refusals)
+  head(board_path, board, schema["board"], refusals)
+  family = board["chip"]
+  unless family.is_a?(String) && family =~ NAME && !family.include?(".")
+    refusals << "#{board_path}: chip must name a chip family, got #{family.inspect}"
+    return finish(refusals, board_path, nil, opt, {})
+  end
+  statements = opt[:chip_dir].map { |d| File.join(d, family, "chip.yaml") }
+  chip_path = statements.find { |p| File.file?(p) }
+  unless chip_path
+    refusals << "#{board_path}: chip #{family} has no statement at #{statements.join(', ')}"
+    return finish(refusals, board_path, family, opt, {})
+  end
+
+  chip = load(chip_path)
+  extra = chip.keys - %w[format version archs cpu values board objects image]
+  refusals << "#{chip_path}: unknown key #{extra.first}" unless extra.empty?
+  head(chip_path, chip, schema["chip"], refusals)
+  archs = chip["archs"]
+  if archs.is_a?(Array) && !archs.empty? && archs.all?(String)
+    if opt[:contract]
+      known = load(opt[:contract])["archs"]
+      unable("#{opt[:contract]}: no archs") unless known.is_a?(Array)
+      (archs - known).each { |a| refusals << "#{chip_path}: architecture #{a} is not one of the contract's (#{known.join(', ')})" }
+    end
+  else refusals << "#{chip_path}: archs must be a non-empty list of names"
+  end
+  refusals << "#{chip_path}: cpu must be a name" unless chip["cpu"].is_a?(String) && chip["cpu"] =~ NAME
+  family_values = chip.fetch("values", {})
+  if family_values.is_a?(Hash)
+    family_values = flatten(family_values)
+    family_values.each do |k, v|
+      refusals << "#{chip_path}: values.#{k} must be a plain integer or a name, got #{v.inspect}" unless
+        v.is_a?(Integer) || (v.is_a?(String) && v =~ NAME)
+    end
+  else
+    refusals << "#{chip_path}: values must be a mapping"
+    family_values = {}
+  end
+  board_rules = rules("#{chip_path}: board", chip.fetch("board", {}))
+  clash = board_rules.keys.find { |k| k == "policy" || k.start_with?("policy.") || %w[format version chip].include?(k.split(".").first) }
+  unable("#{chip_path}: board key #{clash} is the schema's own") if clash
+
+  own = board.reject { |k, _| %w[format version chip policy].include?(k) }
+  policy = board.fetch("policy", {})
+  if policy.is_a?(Hash) then hold("#{board_path}: policy", flatten(policy), policy_rules, refusals)
+  else refusals << "#{board_path}: policy must be a mapping"
+  end
+  hold(board_path, flatten(own), board_rules, refusals)
+
+  values = {}
+  flatten(own).each { |k, v| values["board.#{k}"] = v }
+  flatten(policy.is_a?(Hash) ? policy : {}).each { |k, v| values["policy.#{k}"] = v }
+  family_values.each { |k, v| values["chip.#{k}"] = v }
+  build_keys(chip_path, chip, values, refusals)
+  opt[:head_line] = [family, chip["cpu"], Array(archs).join(","), File.expand_path(File.dirname(chip_path))]
+  finish(refusals, board_path, family, opt, values)
+end
+
+# The two keys of a chip family's statement that say how a build of it is
+# made, both optional. `objects` names a program in the family's directory
+# that makes objects before the link. `image` says what the flash is, as a
+# number or the name of one of this board's values for each of its origin and
+# its size, and which image formats are made besides the flat one.
+def build_keys(chip_path, chip, values, refusals)
+  if chip.key?("objects")
+    o = chip["objects"]
+    refusals << "#{chip_path}: objects must be a path inside the family's directory, got #{o.inspect}" unless
+      o.is_a?(String) && o =~ %r{\A[a-z0-9_][a-z0-9_./-]*\z} && !o.split("/").include?("..")
+  end
+  return unless chip.key?("image")
+
+  image = chip["image"]
+  return refusals << "#{chip_path}: image must be a mapping" unless image.is_a?(Hash)
+
+  extra = image.keys - %w[flash_origin flash_bytes uf2]
+  refusals << "#{chip_path}: image: unknown key #{extra.first}" unless extra.empty?
+  flash = %w[flash_origin flash_bytes].select { |k| image.key?(k) }
+  refusals << "#{chip_path}: image gives #{flash.first} without #{(%w[flash_origin flash_bytes] - flash).first}" if flash.size == 1
+  flash.each do |k|
+    v = image[k]
+    next if v.is_a?(Integer) && v >= 0
+    next if v.is_a?(String) && values[v].is_a?(Integer)
+
+    refusals << "#{chip_path}: image.#{k} must be a number or name an integer value of the board (#{values.select { |_, x| x.is_a?(Integer) }.keys.join(', ')}), got #{v.inspect}"
+  end
+  return unless image.key?("uf2")
+
+  uf2 = image["uf2"]
+  id = uf2.is_a?(Hash) ? uf2["family_id"] : nil
+  refusals << "#{chip_path}: image.uf2 must be {family_id: N}, N a 32-bit number" unless
+    uf2.is_a?(Hash) && uf2.keys == ["family_id"] && id.is_a?(Integer) && id.between?(1, 0xffffffff)
+end
+
+def finish(refusals, board_path, family, opt, values)
+  name = File.basename(board_path, ".yaml")
+  if refusals.empty?
+    if opt[:values] then values.each { |k, v| puts "#{k}\t#{v}" }
+    elsif opt[:head] then puts [name, *opt[:head_line]].join("\t")
+    else puts "#{PROG}: valid (#{name}, chip #{family})"
+    end
+    0
+  else
+    refusals.uniq.each { |r| warn "#{PROG}: refused: #{r}" }
+    warn "#{PROG}: refused (#{refusals.uniq.size})"
+    1
+  end
+end
+
+begin
+  exit main(ARGV.dup)
+rescue Unable => e
+  warn "#{PROG}: #{e.message}"
+  exit 2
+end

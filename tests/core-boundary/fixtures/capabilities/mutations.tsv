@@ -1,0 +1,13 @@
+# Controls. Each row changes ONE point of ONE source; the kernel built from
+# the changed source must then give a different answer from cases.tsv for at
+# least one case. A control that still passed every case would mean the table
+# cannot see that part of the computation.
+#
+#id	file	old	new	what it would hide
+wrap-bias	wrap_i32.rb	& 0xffffffff) - 0x80000000	& 0xffffffff) - 0	the masked value never read back as signed
+mask-width	mask_u32.rb	0xffffffff	0x7fffffff	the top bit of the low word dropped
+div-sign	div_trunc.rb	d < 0 ? q : -q	d < 0 ? q : q	a negative dividend answering a positive quotient
+mul-shift	q8_mul.rb	>> 8	>> 7	the product keeping one fraction bit too many
+qdiv-zero	q8_div.rb	a < 0 ? Q8_MIN : Q8_MAX	a < 0 ? Q8_MAX : Q8_MIN	a zero divisor answering the wrong limit
+qdiv-clamp	q8_div.rb	q < Q8_MIN ? Q8_MIN : q	q < Q8_MIN ? q : q	the negative side not clamped
+qdiv-scale	q8_div.rb	n = a * 256	n = a * 128	the dividend scaled by the wrong power of two

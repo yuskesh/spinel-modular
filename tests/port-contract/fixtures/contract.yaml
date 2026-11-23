@@ -1,0 +1,49 @@
+# The contract of the control build in this directory. Its names are not the
+# shipped contract's: tools/platform/port-check must work from the file alone.
+format: spinel-port-contract
+version: 1
+tiers: [core, arena, full]
+archs: [one, two]
+parts:
+  program: { group: hosted }
+  runtime: { group: hosted }
+  libc:    { ambient: true }
+  base:    {}
+  chip:    { surface: closed }
+  link:    { image: true }
+capabilities:
+  start:
+    tier: arena
+    arch: all
+    symbols:
+      - { from: base, to: [link], names: [t_reset] }
+      - { from: link, to: [base], names: [t_ram_top] }
+      - { from: program, to: [base], names: [t_main] }
+      - { from: chip, to: [base], names: [t_chip_init] }
+    sections:
+      - { from: base, to: [link], names: [.t_vectors] }
+      - { from: chip, to: [link], names: [.t_boot], optional: true }
+  constructors:
+    tier: arena
+    arch: all
+    symbols:
+      - { from: link, to: [libc], names: [t_ctors_start, t_ctors_end, __init_array_start, __init_array_end] }
+  console:
+    tier: arena
+    arch: all
+    symbols:
+      - { from: base, to: [hosted], names: [t_out] }
+      - { from: chip, to: [base], names: [t_putc] }
+      - { from: base, to: [chip], names: [t_hex] }
+  clock:
+    tier: full
+    arch: all
+    symbols:
+      - { from: base, to: [runtime], names: [t_time] }
+      - { from: chip, to: [base], names: [t_hz] }
+      - { from: chip, to: [base], names: [t_us], optional: true }
+  locks:
+    tier: arena
+    arch: [one]
+    symbols:
+      - { from: base, to: [hosted], names: [t_lock] }

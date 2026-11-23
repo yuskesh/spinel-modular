@@ -1,0 +1,499 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#
+# tools/bare-full/spinel-bare-full -- a hosted Spinel program, with its
+# collector, on a Cortex-M with no RTOS.
+#
+#   spinel-bare-full runtime [--cpu m33|m0plus] DIR
+#       compiles the pinned runtime for that core (default m33) into
+#       DIR/libspinel_rt_bare.a, and names the core in DIR/cpu
+#   spinel-bare-full boards [--port-dir DIR]...
+#       prints one line per board the port directories hold, sorted by name:
+#       the name, the board file, the chip family the file names and that
+#       family's directory (empty when no port directory holds it), separated
+#       by tabs. It needs no toolchain.
+#   spinel-bare-full build --runtime ARCHIVE [--board BOARD] [--port-dir DIR]...
+#                          [--heap-kb N] [--set KEY=N] [--steps LIST]
+#                          [--link-chip FILE] [--link-runtime FILE]
+#                          [--link-add FILE]... APP.rb OUT.elf
+#       compiles APP.rb and links it with the runtime, picolibc, compiler-rt's
+#       builtins, the base (platform/common) and the board's chip family;
+#       OUT.elf.map is the link map and OUT.elf.bin the flash image. BOARD
+#       (default an521) is a board file, board/BOARD.yaml in a port
+#       directory. A board file holds values only and names its chip family,
+#       chip/FAMILY/ in a port directory, which holds the code, the link
+#       script and the core. --set overrides one integer value of the board
+#       file by its key path, for example --set policy.stack_bytes=16384
+#
+#       A port directory holds board files (board/NAME.yaml) and chip
+#       families (chip/FAMILY/), either or both. This directory is one; the
+#       others are given with --port-dir and BAREMETAL_PORT_PATH, so a board
+#       or a chip family need not be in this repository. They are searched
+#       in this order: those of --port-dir as given, those of the variable,
+#       then this directory. The board file is the first found, and its
+#       chip family is searched for from the start again: a board file
+#       outside may name a family here, and a family outside takes the place
+#       of one here of the same name. When more than one directory holds the
+#       name, a line on standard error says which was used. A directory given
+#       that has neither board/ nor chip/ is refused. A chip family's
+#       `objects` program is run by the build: a port directory holds code
+#       that the build runs. OUT.elf.d/found records the board file and the
+#       family's directory a build was made from; a later --steps run that
+#       finds others is refused.
+#
+#       A build is six steps: values, program, platform, objects, link, image
+#       (README.md says what each reads and writes). --steps LIST runs only
+#       the named ones, on what earlier runs left in OUT.elf.d. The link
+#       script is the chip family's part, then the runtime's
+#       (platform/common/link.ld); --link-chip and --link-runtime give another
+#       file for one of them, and --link-add one more part after both.
+#       OUT.elf.uf2 is written too when the chip family declares the format.
+#
+# Environment:
+#   LLVM_PREFIX          the LLVM 23.1.1 release (clang, lld, llvm-ar)
+#   BAREMETAL_PICOLIBC   picolibc's install prefix for the board's core
+#                        (docs/toolchains/picolibc-1.8.12)
+#   BAREMETAL_BUILTINS   compiler-rt's builtins archive for that core
+#                        (docs/toolchains/compiler-rt-23.1.1)
+#   SPINEL_DIR           the Spinel checkout (default: this repository's vendor/spinel)
+#   BAREMETAL_PORT_PATH  port directories to search before this one,
+#                        separated by ":" (after those of --port-dir)
+#
+# The runtime and the program are compiled with the defines, header stand-ins
+# and forced header in runtime/ (runtime/defines, runtime/shim,
+# runtime/force.h). Exit 2 when the environment is missing.
+require "fileutils"
+require "open3"
+require "rbconfig"
+require "yaml"
+
+ROOT = File.expand_path("../..", __dir__)
+HERE = __dir__
+RUNTIME = File.join(HERE, "runtime")
+
+CPUS = {
+  "m33" => %w[--target=thumbv8m.main-none-eabi -mcpu=cortex-m33+nodsp -mfloat-abi=soft -mthumb],
+  "m0plus" => %w[--target=thumbv6m-none-eabi -mcpu=cortex-m0plus -mfloat-abi=soft -mthumb]
+}.freeze
+COPT = %w[-Os -ffunction-sections -fdata-sections -std=gnu2x -w].freeze
+PORT_PATH = "BAREMETAL_PORT_PATH"
+NAME = /\A[a-z0-9][a-z0-9-]*\z/
+BUILD_USAGE = "build --runtime ARCHIVE [--board BOARD] [--port-dir DIR]... [--heap-kb N] [--set KEY=N] [--steps LIST] [--link-chip FILE] [--link-runtime FILE] [--link-add FILE]... APP.rb OUT.elf"
+
+def die(msg, code = 1)
+  warn "spinel-bare-full: #{msg}"
+  exit code
+end
+
+def env!(name)
+  v = ENV.fetch(name, "")
+  die("#{name} is not set", 2) if v.empty?
+  v
+end
+
+def run!(*cmd, chdir: nil, log: nil)
+  opts = chdir ? { chdir: chdir } : {}
+  out, st = Open3.capture2e(*cmd, **opts)
+  File.write(log, out) if log
+  return if st.success?
+
+  # the first lines too: a chip family refuses a value with #error, and the
+  # compiler prints that before the errors that follow from it
+  l = out.lines
+  warn (l.size > 50 ? l.first(20) + ["...\n"] + l.last(30) : l).join
+  die("failed: #{cmd.first(3).join(' ')} ...")
+end
+
+def toolchain
+  llvm = env!("LLVM_PREFIX")
+  libc = env!("BAREMETAL_PICOLIBC")
+  builtins = env!("BAREMETAL_BUILTINS")
+  clang = File.join(llvm, "bin/clang")
+  die("no #{clang}", 2) unless File.executable?(clang)
+  die("BAREMETAL_PICOLIBC has no include/ and lib/libc.a: #{libc}", 2) unless File.file?(File.join(libc, "lib/libc.a"))
+  die("BAREMETAL_BUILTINS is not a file: #{builtins}", 2) unless File.file?(builtins)
+  resource = IO.popen([clang, "-print-resource-dir"], &:read).strip
+  { clang: clang, bin: File.join(llvm, "bin"), libc: libc, builtins: builtins, resource: resource }
+end
+
+# runtime/defines: one list for the runtime and the generated code
+def rt_defs
+  defs = File.readlines(File.join(RUNTIME, "defines"), chomp: true).map(&:strip).reject { |l| l.empty? || l.start_with?("#") }
+  die("runtime/defines names no define") if defs.empty?
+  defs.map { |d| "-D#{d}" }
+end
+
+def spinel_dir
+  File.expand_path(ENV.fetch("SPINEL_DIR", File.join(ROOT, "vendor/spinel")))
+end
+
+# the runtime's headers, the stand-ins of runtime/shim, then picolibc's: the
+# stand-ins come first so that they fill what picolibc leaves out
+def includes(tc)
+  v = spinel_dir
+  ["-I#{v}/lib", "-I#{v}/lib/regexp", "-I#{v}/lib/regexp/shim",
+   "-isystem", "#{RUNTIME}/shim", "-include", "#{RUNTIME}/force.h",
+   "-nostdinc", "-isystem", "#{tc[:libc]}/include", "-isystem", "#{tc[:resource]}/include"]
+end
+
+# assertions keep __FILE__ in the image: name the sources by a fixed prefix,
+# not by where this checkout and the work directory are
+def prefix_map(work = nil, chip: nil)
+  m = ["-ffile-prefix-map=#{spinel_dir}=spinel", "-ffile-prefix-map=#{HERE}=bare-full"]
+  m << "-ffile-prefix-map=#{work}=app" if work
+  # a chip family has one name wherever its directory is
+  m << "-ffile-prefix-map=#{chip}=bare-full/chip/#{File.basename(chip)}" if chip
+  m
+end
+
+# The port directories, in the order they are searched: those of --port-dir
+# as given, those of BAREMETAL_PORT_PATH, then the driver's own. A port
+# directory holds board files (board/NAME.yaml) and chip families
+# (chip/FAMILY/), either or both, laid out as beside the driver.
+def port_dirs(given)
+  env = ENV.fetch(PORT_PATH, "").split(File::PATH_SEPARATOR).reject(&:empty?)
+  user = given.map { |d| ["--port-dir", d, 64] } + env.map { |d| [PORT_PATH, d, 2] }
+  user.each do |from, d, code|
+    die("#{from}: #{d} is not a port directory (it has neither board/ nor chip/)", code) unless
+      File.directory?(File.join(d, "board")) || File.directory?(File.join(d, "chip"))
+  end
+  (user.map { |_, d, _| File.expand_path(d) } + [HERE]).uniq
+end
+
+# every port directory's file for a board, the one used first
+def board_files(dirs, name)
+  dirs.map { |d| File.join(d, "board", "#{name}.yaml") }.select { |f| File.file?(f) }
+end
+
+# every port directory's directory for a chip family, the one used first
+def chip_dirs(dirs, family)
+  dirs.map { |d| File.join(d, "chip", family) }.select { |c| File.file?(File.join(c, "chip.yaml")) }
+end
+
+def board_names(dirs)
+  dirs.flat_map { |d| Dir[File.join(d, "board/*.yaml")] }.map { |f| File.basename(f, ".yaml") }.grep(NAME).uniq.sort
+end
+
+# a name held by more than one port directory: say which was taken
+def note_others(what, found)
+  warn "spinel-bare-full: #{what}: using #{found.first}, not #{found.drop(1).join(', ')}" if found.size > 1
+end
+
+# spinel-bare-full boards: one line per board the port directories hold: its
+# name, its file, its chip family and the family's directory (empty when no
+# port directory holds the family), tab-separated
+def cmd_boards(args)
+  given = []
+  until args.empty?
+    a = args.shift
+    die("usage: spinel-bare-full boards [--port-dir DIR]...", 64) unless a == "--port-dir" && !args.empty?
+    given << args.shift
+  end
+  dirs = port_dirs(given)
+  board_names(dirs).each do |name|
+    file = board_files(dirs, name).first
+    family = (YAML.safe_load_file(file) || {})["chip"].to_s
+    puts [name, file, family, family.match?(NAME) ? chip_dirs(dirs, family).first : nil].join("\t")
+  end
+end
+
+def cmd_runtime(args)
+  cpu = "m33"
+  if args.first == "--cpu"
+    args.shift
+    cpu = args.shift
+  end
+  die("usage: spinel-bare-full runtime [--cpu #{CPUS.keys.join('|')}] DIR", 64) unless args.size == 1 && CPUS.key?(cpu)
+  tc = toolchain
+  dir = File.expand_path(args[0])
+  obj = File.join(dir, "obj")
+  FileUtils.mkdir_p(obj)
+  mk = File.read(File.join(spinel_dir, "Makefile"))
+  members = mk[/^RT_MEMBERS\s*=\s*(.+)$/, 1].to_s.split
+  regexp = mk[/^RE_SRC\s*=\s*(.+)$/, 1].to_s.split
+  die("no RT_MEMBERS or RE_SRC in #{spinel_dir}/Makefile") if members.empty? || regexp.empty?
+  objs = (members.map { |m| "lib/#{m}.c" } + regexp).map do |s|
+    o = File.join(obj, "#{File.basename(s, '.c')}.o")
+    run!(tc[:clang], *CPUS[cpu], *COPT, *rt_defs, *includes(tc), *prefix_map, "-c", File.join(spinel_dir, s), "-o", o)
+    o
+  end
+  lib = File.join(dir, "libspinel_rt_bare.a")
+  FileUtils.rm_f(lib)
+  run!(File.join(tc[:bin], "llvm-ar"), "rcs", lib, *objs)
+  File.write(File.join(dir, "cpu"), "#{cpu}\n")
+  puts lib
+end
+
+# every integer under a map, as [dotted.key.path, value]; a name (a string)
+# selects something and makes no define
+def leaves(map, path = [])
+  map.flat_map do |k, v|
+    case v
+    when Hash then leaves(v, path + [k])
+    when Integer then [[(path + [k]).join("."), v]]
+    else []
+    end
+  end
+end
+
+# Every integer value of a build, under the name tools/platform/board-check
+# prints it with: a chip family's `values` are chip.<path>, a board's
+# `policy` group policy.<key>, its other groups board.<path>; --set overrides
+# a board value.
+def board_values(board, chip, sets)
+  vals = leaves(chip.fetch("values", {})).to_h { |k, v| ["chip.#{k}", v] }
+  leaves(board.reject { |k, _| %w[format version chip].include?(k) }).to_h.merge(sets).each do |k, v|
+    vals[k.start_with?("policy.") ? k : "board.#{k}"] = v
+  end
+  vals
+end
+
+# The values as the header every platform source, the chip family's objects and the link parts
+# are compiled with: one define per value, BF_<NAME> with the name in upper
+# case and `_` for `.`, named from the key path and from nothing else.
+def board_header(values, path)
+  text = values.map { |k, v| "#define BF_#{k.upcase.tr('.', '_')} #{v}\n" }.sort.join
+  File.write(path, "/* generated by spinel-bare-full from the board and chip files; do not edit */\n" + text)
+end
+
+# the loaded segments of a 32-bit little-endian ELF file that have bytes in
+# the file, as [load (physical) address, bytes]
+def loaded_segments(elf)
+  die("not a 32-bit little-endian ELF file") unless elf[0, 4] == "\x7FELF".b && elf.getbyte(4) == 1 && elf.getbyte(5) == 1
+  phoff = elf[0x1C, 4].unpack1("V")
+  phentsize, phnum = elf[0x2A, 4].unpack("vv")
+  (0...phnum).filter_map do |i|
+    type, off, _vaddr, paddr, filesz = elf[phoff + i * phentsize, 20].unpack("V5")
+    [paddr, elf[off, filesz]] if type == 1 && filesz.positive?
+  end
+end
+
+# UF2 (https://github.com/microsoft/uf2): 512-byte blocks of 256 payload
+# bytes. Every loaded segment goes to its load address, so .data is where the
+# start-up copies it from; a gap inside a 256-byte page is zero.
+UF2_PAGE = 256
+def uf2_image(segments, family)
+  pages = {}
+  segments.each do |paddr, bytes|
+    bytes.each_byte.with_index do |b, j|
+      a = paddr + j
+      (pages[a & ~(UF2_PAGE - 1)] ||= ("\0" * UF2_PAGE).b).setbyte(a & (UF2_PAGE - 1), b)
+    end
+  end
+  n = pages.size
+  pages.sort.each_with_index.map do |(addr, data), i|
+    [0x0A324655, 0x9E5D5157, 0x00002000, addr, UF2_PAGE, i, n, family].pack("V8") +
+      data + ("\0" * (476 - UF2_PAGE)) + [0x0AB16F30].pack("V")
+  end.join
+end
+
+# The steps of a build, in order. Each reads what the steps before it left in
+# OUT.elf.d and writes there, so --steps can run some of them again.
+STEPS = %w[values program platform objects link image].freeze
+
+def cmd_build(args)
+  board = "an521"
+  heap_kb = nil
+  runtime = nil
+  sets = {}
+  steps = STEPS
+  parts = { "chip" => nil, "runtime" => nil }
+  added = []
+  given = []
+  rest = []
+  until args.empty?
+    a = args.shift
+    case a
+    when "--board" then board = args.shift.to_s
+    when "--port-dir" then given << (args.shift || die("--port-dir takes a directory", 64))
+    when "--heap-kb" then heap_kb = Integer(args.shift, exception: false) || die("--heap-kb takes a number", 64)
+    when "--runtime" then runtime = args.shift
+    when "--set"
+      k, v = args.shift.to_s.split("=", 2)
+      sets[k] = Integer(v.to_s, exception: false) || die("--set takes KEY=N, N an integer", 64)
+    when "--steps"
+      steps = args.shift.to_s.split(",")
+      die("--steps takes names from #{STEPS.join(',')}", 64) unless steps.any? && (steps - STEPS).empty?
+    when "--link-chip", "--link-runtime", "--link-add"
+      p = args.shift.to_s
+      die("#{a}: no file #{p}", 64) unless File.file?(p)
+      a == "--link-add" ? added << File.expand_path(p) : parts[a.delete_prefix("--link-")] = File.expand_path(p)
+    else rest << a
+    end
+  end
+  die("usage: spinel-bare-full #{BUILD_USAGE}", 64) unless rest.size == 2 && runtime
+  dirs = port_dirs(given)
+  boards = board.match?(NAME) ? board_files(dirs, board) : []
+  die("--board #{board}: no board/#{board}.yaml in #{dirs.join(', ')} (the boards there: #{board_names(dirs).join(', ')})", 64) if boards.empty?
+  board_path = boards.first
+  bfile = YAML.safe_load_file(board_path)
+  family = bfile["chip"].to_s
+  chips = family.match?(NAME) ? chip_dirs(dirs, family) : []
+  die("#{board_path} names chip #{family.inspect}; no chip/#{family}/chip.yaml in #{dirs.join(', ')}") if chips.empty?
+  chipdir = chips.first
+  note_others("board #{board}", boards)
+  note_others("chip #{family}", chips)
+  chip = YAML.safe_load_file(File.join(chipdir, "chip.yaml"))
+  # a key --set may name: one the chip family lists for its boards, or a policy value
+  # and for a key the family lists, its rule holds for the value given here:
+  # --set is the one way a value arrives that no check of the board file sees
+  sets.each do |k, v|
+    rule = chip.fetch("board", {})[k]
+    unless rule
+      next if k.match?(/\Apolicy\.[a-z0-9_]+\z/)
+
+      die("--set #{k}: not a board value of chip #{family} (#{chip.fetch('board', {}).keys.join(', ')}) and not policy.NAME", 64)
+    end
+    die("--set #{k}: the value is a name, not a number; it is set in the board file", 64) unless rule["type"] == "int"
+    ok = (!rule["min"] || v >= rule["min"]) && (!rule["max"] || v <= rule["max"]) &&
+         (!rule["one_of"] || rule["one_of"].include?(v))
+    die("--set #{k}=#{v}: chip #{family} takes #{rule.reject { |r, _| r == 'type' }.map { |r, x| "#{r} #{x.inspect}" }.join(', ')}", 64) unless ok
+  end
+  die("no runtime archive #{runtime}: run spinel-bare-full runtime first", 2) unless File.file?(runtime)
+  cpu = chip["cpu"]
+  die("chip/#{family}/chip.yaml: cpu is #{cpu.inspect}, not one of #{CPUS.keys.join(', ')}") unless CPUS.key?(cpu)
+  made_for = File.read(File.join(File.dirname(runtime), "cpu")).strip rescue nil
+  die("#{runtime} was built for #{made_for || 'an unknown core'}; #{board} needs runtime --cpu #{cpu}") unless made_for == cpu
+  target = CPUS[cpu]
+  tc = toolchain
+  app, out = rest.map { |p| File.expand_path(p) }
+  work = "#{out}.d"
+  FileUtils.mkdir_p(work)
+  header = File.join(work, "bf-board.h")
+  values = board_values(bfile, chip, sets)
+  # which board file and which family this directory is a build of: the
+  # values step writes it, and a later run that finds another is refused
+  found = File.join(work, "found")
+  record = "board\t#{board_path}\nchip\t#{chipdir}\n"
+  die("#{work} was made from\n#{File.read(found)}and this run finds\n#{record}run step values again, or give the port directories of that run", 2) if
+    !steps.include?("values") && File.file?(found) && File.read(found) != record
+  # what a step leaves for the link: the objects it made, in link order
+  made = ->(step, objs) { File.write(File.join(work, "objects.#{step}"), objs.map { |o| "#{o}\n" }.join) }
+  need = lambda do |path, step|
+    die("no #{path}: run step #{step} first (--steps #{STEPS.join(',')})", 2) unless File.file?(path)
+  end
+
+  run = {
+    # the board's and the family's values, as defines
+    "values" => lambda do
+      board_header(values, header)
+      File.write(found, record)
+    end,
+    # the Ruby program, compiled to C by Spinel and to an object
+    "program" => lambda do
+      spinel = File.join(spinel_dir, "bin/spinel")
+      die("no #{spinel}: build vendor/spinel first", 2) unless File.executable?(spinel)
+      # --cc names the target's compiler, so Spinel asks it the pointer width
+      run!(spinel, File.basename(app), "--cc=#{tc[:clang]} #{target.first}", "-c", "-o", File.join(work, "app.c"),
+           chdir: File.dirname(app), log: File.join(work, "spinel.log"))
+      o = File.join(work, "app.o")
+      run!(tc[:clang], *target, *COPT, *rt_defs, *includes(tc), *prefix_map(work), "-Dmain=sp_app_main",
+           "-c", File.join(work, "app.c"), "-o", o)
+      made.call("program", [o])
+    end,
+    # the base and the chip family's code. One link order on every board: the
+    # base (sorted by name), then the chip family. The order is part of the
+    # image: changing it moves code
+    "platform" => lambda do
+      need.call(header, "values")
+      plat = Dir[File.join(HERE, "platform/common/*.c")].sort.map { |c| ["plat", c] } +
+             Dir[File.join(chipdir, "*.c")].sort.map { |c| ["chip", c] }
+      objs = plat.map do |kind, c|
+        o = File.join(work, "#{kind}-#{File.basename(c, '.c')}.o")
+        run!(tc[:clang], *target, *COPT, *prefix_map(chip: chipdir), "-Wall", "-I#{HERE}/platform/common", "-include", header, "-nostdinc",
+             "-isystem", "#{tc[:libc]}/include", "-isystem", "#{tc[:resource]}/include", "-c", c, "-o", o)
+        o
+      end
+      made.call("platform", objs)
+    end,
+    # objects the chip family makes itself (a second-stage boot block, say):
+    # its program, named by `objects` in chip.yaml, prints their paths
+    "objects" => lambda do
+      need.call(header, "values")
+      hook = chip["objects"]
+      objs = []
+      if hook
+        prog = File.join(chipdir, hook.to_s)
+        die("chip/#{family}/chip.yaml: objects is #{hook.inspect}; there is no such file in chip/#{family}/") unless
+          hook.to_s.match?(%r{\A[a-z0-9_][a-z0-9_./-]*\z}) && !hook.to_s.include?("..") && File.file?(prog)
+        # its standard output is the list; what it has to say goes to stderr
+        text, err, st = Open3.capture3(RbConfig.ruby, prog, "--board", board_path, "--header", header, "--out", work,
+                                       "--", tc[:clang], *target)
+        unless st.success?
+          warn err
+          die("failed: chip/#{family}/#{hook}")
+        end
+        objs = text.lines.map(&:strip).reject(&:empty?)
+        objs.each { |o| die("chip/#{family}/#{hook} named #{o}, which is not a chip-*.o in #{work}") unless File.dirname(o) == work && File.basename(o).match?(/\Achip-.+\.o\z/) && File.file?(o) }
+      end
+      made.call("objects", objs)
+    end,
+    # the link script's parts with the values in place, then the link. The
+    # chip family's part declares the memory; the runtime's part places the
+    # sections and defines the symbols; --link-add parts come after
+    "link" => lambda do
+      need.call(header, "values")
+      objs = %w[program platform objects].flat_map do |s|
+        need.call(File.join(work, "objects.#{s}"), s)
+        File.readlines(File.join(work, "objects.#{s}"), chomp: true)
+      end
+      srcs = [["chip", parts["chip"] || File.join(chipdir, "link.ld")],
+              ["runtime", parts["runtime"] || File.join(HERE, "platform/common/link.ld")]] +
+             added.each_with_index.map { |p, i| ["add-#{i + 1}", p] }
+      scripts = srcs.map do |name, src|
+        s = File.join(work, "link-#{name}.ld")
+        run!(tc[:clang], "-E", "-P", "-x", "c", "-nostdinc", "-include", header, src, "-o", s)
+        "-Wl,-T,#{s}"
+      end
+      link = ["-nostdlib", "-fuse-ld=lld", *scripts, "-Wl,--gc-sections", "-Wl,-Map,#{out}.map"]
+      link << "-Wl,--defsym=__bf_heap_bytes=#{heap_kb * 1024}" if heap_kb
+      run!(tc[:clang], *target, *link, *objs, "-Wl,--start-group", runtime, tc[:builtins],
+           File.join(tc[:libc], "lib/libc.a"), "-Wl,--end-group", "-o", out, log: File.join(work, "link.log"))
+    end,
+    # The image formats: the flat image from the code's first address, for a
+    # board's flash tool, and those the chip family declares under `image`.
+    # Where the family says what its flash is (image.flash_origin and
+    # image.flash_bytes, each a number or the name of a value of the build),
+    # a segment loaded anywhere else stops the step before any format is
+    # written: a .data a replaced link part stores in RAM would otherwise
+    # give a flat image of hundreds of megabytes and a UF2 that boots nothing
+    "image" => lambda do
+      need.call(out, "link")
+      FileUtils.rm_f(["#{out}.bin", "#{out}.uf2"]) # not an earlier build's
+      image = chip.fetch("image", {})
+      segments = loaded_segments(File.binread(out))
+      origin, bytes = %w[flash_origin flash_bytes].map do |k|
+        v = image[k]
+        v = values[v] if v.is_a?(String)
+        v.nil? || v.is_a?(Integer) ? v :
+          die("chip/#{family}/chip.yaml: image.#{k} is #{image[k].inspect}, which is not a number and names no value of the board or the chip (#{values.keys.join(', ')})")
+      end
+      die("chip/#{family}/chip.yaml: image gives one of flash_origin and flash_bytes without the other") if origin.nil? != bytes.nil?
+      if origin
+        segments.each do |paddr, data|
+          next if paddr >= origin && paddr + data.bytesize <= origin + bytes
+
+          die(format("a loaded segment at 0x%08x (%d bytes) is outside the flash, 0x%08x to 0x%08x; nothing was written",
+                     paddr, data.bytesize, origin, origin + bytes))
+        end
+      end
+      run!(File.join(tc[:bin], "llvm-objcopy"), "-O", "binary", out, "#{out}.bin")
+      uf2 = image["uf2"]
+      if uf2
+        id = uf2["family_id"]
+        die("chip/#{family}/chip.yaml: image.uf2.family_id is #{id.inspect}, not a 32-bit number") unless id.is_a?(Integer) && id.between?(1, 0xffffffff)
+        File.binwrite("#{out}.uf2", uf2_image(segments, id))
+      end
+    end
+  }
+  STEPS.each { |s| run[s].call if steps.include?(s) }
+  puts out
+end
+
+cmd = ARGV.shift
+case cmd
+when "runtime" then cmd_runtime(ARGV)
+when "build" then cmd_build(ARGV)
+when "boards" then cmd_boards(ARGV)
+else die("usage: spinel-bare-full runtime [--cpu #{CPUS.keys.join('|')}] DIR | boards [--port-dir DIR]... | #{BUILD_USAGE}", 64)
+end

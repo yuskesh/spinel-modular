@@ -1,0 +1,5 @@
+core-contract 1
+root src/wrap_i32.rb
+entry wrap_i32
+result i32
+param v scalar i64

@@ -1,0 +1,6 @@
+core-contract 1
+root src/q8_div.rb
+entry q8_div
+result i32
+param a scalar i32
+param b scalar i32

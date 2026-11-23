@@ -1,0 +1,65 @@
+# A screen of six by five pixels, the tables the kernels read, the jobs that
+# draw on it and the screen they must leave. Every number here was worked out
+# by hand from the definitions under src/; no other implementation is run to
+# produce them.
+#
+# Tab-separated lines:
+#
+#   size    W  H
+#   pat     the pattern col_fill repeats
+#   tile    the eight entries row_fill samples
+#   lut     the lookup table, 16 entries a row: row 0 leaves a value as it
+#           is, row 1 turns v into 15 - v
+#   offs    the row distances col_smear reads at
+#   job     kernel and seven fields (- where a kernel has fewer):
+#             col    x  y0  y1  start  step  period  row
+#             row    y  x0  x1  u      du    row     -
+#             smear  x  y0  y1  phase  period  row   -
+#   screen  one row of the screen the jobs must leave, top row first
+#   check   id, a job, then: short  status  moved
+#
+# The screen starts at 0 everywhere. A check runs on a fresh screen. `short`
+# names a table declared one cell shorter than it is, or -. `status` is 0 OK,
+# 2 ARITHMETIC, 3 BOUNDS. `moved` is, for a refusal, the number of pixels the
+# call drew before it stopped, which a direct caller can still read.
+size	6	5
+pat	1,2,3
+tile	4,5,6,7,8,9,10,11
+lut	0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0
+offs	-1,1
+# Column 1 takes the pattern in order: 1, 2, 3, 1, 2.
+job	col	1	0	4	0	1	3	0
+# Column 4, rows 1 to 3, steps by two from the last entry (3, 2, 1) through row 1 of the table: 12, 13, 14.
+job	col	4	1	3	2	2	3	1
+# Row 2 samples the tile every 1.5 entries: entries 0, 1, 3, 4, 6, 7, so 4, 5, 7, 8, 10, 11. It crosses both columns.
+job	row	2	0	5	0	384	0	-
+# Column 1, rows 1 to 3, from its neighbours through row 1 of the table: row 1 reads row 0 (1 -> 14), row 2 reads row 3
+# (1 -> 14), row 3 reads row 2, which this job has just drawn (14 -> 1).
+job	smear	1	1	3	0	2	1	-
+# Column 4, row 2, reads row 3 (14) unchanged.
+job	smear	4	2	2	1	2	0	-
+screen	0,1,0,0,0,0
+screen	0,14,0,0,12,0
+screen	4,14,7,8,14,11
+screen	0,1,0,0,14,0
+screen	0,2,0,0,0,0
+#
+# Checks. Each edge has the case just inside it and the one just outside.
+check	col-last-row	col	5	4	4	0	1	3	0	-	0	-
+check	col-past-the-bottom	col	5	4	5	0	1	3	0	-	3	1
+check	col-pattern-last	col	0	0	0	2	1	3	0	-	0	-
+check	col-pattern-past	col	0	0	0	3	1	4	0	-	3	0
+check	col-short-pattern	col	0	0	0	2	1	3	0	pat	3	0
+check	col-table-last-row	col	0	0	0	0	1	3	1	-	0	-
+check	col-table-past	col	0	0	0	0	1	3	2	-	3	0
+check	row-last-pixel	row	4	5	5	0	0	0	-	-	0	-
+check	row-past-the-end	row	4	5	6	0	0	0	-	-	3	1
+check	row-tile-last	row	0	0	0	1792	0	0	-	-	0	-
+check	row-short-tile	row	0	0	0	1792	0	0	-	tile	3	0
+check	row-overflow	row	4611686018427387904	0	0	0	0	0	-	-	2	0
+check	smear-first-row-down	smear	0	0	0	1	2	0	-	-	0	-
+check	smear-above-the-top	smear	0	0	0	0	2	0	-	-	3	0
+check	smear-last-row-up	smear	0	4	4	0	2	0	-	-	0	-
+check	smear-below-the-bottom	smear	0	4	4	1	2	0	-	-	3	0
+check	smear-offsets-last	smear	0	1	1	1	2	0	-	-	0	-
+check	smear-offsets-past	smear	0	1	1	2	3	0	-	-	3	0

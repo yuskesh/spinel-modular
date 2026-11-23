@@ -1,0 +1,11 @@
+# The core and freestanding drivers.
+add_subdirectory(spinel-fs-check)
+add_subdirectory(spinel-fs-emit)
+add_subdirectory(spinel-fs-codegen)
+add_subdirectory(spinel-core-check)
+add_subdirectory(spinel-core-emit)
+add_subdirectory(spinel-core-boundary)
+add_subdirectory(spinel-core-kernel)
+add_subdirectory(spinel-core-stack)
+add_subdirectory(spinel-core-adapter)
+add_subdirectory(spinel-core-package)

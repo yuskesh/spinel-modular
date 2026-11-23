@@ -1,0 +1,12 @@
+core-contract 1
+root src/queue_put.rb
+entry queue_put
+result i64
+param i scalar i64
+param value scalar i64
+param vals buffer i32 inout count n_vals
+param n_vals scalar u64
+param nxt buffer i32 inout count n_nxt
+param n_nxt scalar u64
+param q buffer i32 inout count n_q
+param n_q scalar u64

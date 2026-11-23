@@ -1,0 +1,6 @@
+# The platform-first form of riscv32-zephyr.yaml.
+# See zephyr-cortex-m33.yaml for the reading; only the arch differs, which is
+# the whole point of the three-layer split.
+platform: zephyr
+arch: riscv32
+supplies: trap-only

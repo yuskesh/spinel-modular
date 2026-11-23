@@ -1,0 +1,10 @@
+# Arithmetic reference kernel for the checked scalar mode.
+#
+# One definition per file. There is no caller and no evidence call: the
+# contract declares each parameter's domain, and the checker derives the rest of
+# the closure from those facts and validates every use against them.
+# Parenthesised subexpressions, evaluated in order.
+
+def paren(a, b)
+  (a + b) * (a - b)
+end

@@ -1,0 +1,8 @@
+core-contract 1
+root src/queue_take.rb
+entry queue_take
+result i64
+param nxt buffer i32 inout count n_nxt
+param n_nxt scalar u64
+param q buffer i32 inout count n_q
+param n_q scalar u64

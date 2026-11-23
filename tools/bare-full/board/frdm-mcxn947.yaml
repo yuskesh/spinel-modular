@@ -1,0 +1,18 @@
+# NXP FRDM-MCXN947. Values only; the code is the chip family's (chip/mcxn947/).
+# The console is the MCU-Link's UART: P1_8 is FC4_P0_UART_RXD_MCULINK and P1_9
+# is FC4_P1_UART_TXD_MCULINK (FRDM-MCXN947 Board User Manual, Table 24, as
+# cited in tests/freestanding/bare-frdm/src/main.c).
+format: spinel-board
+version: 1
+chip: mcxn947
+console:
+  flexcomm: 4
+  port: 1
+  rx: 8
+  tx: 9
+  mux: 2
+  baud: 115200
+policy:
+  gc_slab: 0
+  gc_threshold_kb: 16
+  stack_bytes: 32768

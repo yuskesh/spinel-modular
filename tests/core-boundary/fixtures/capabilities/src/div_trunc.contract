@@ -1,0 +1,6 @@
+core-contract 1
+root src/div_trunc.rb
+entry div_trunc
+result i32
+param n scalar i64
+param d scalar i64

@@ -1,0 +1,15 @@
+# Controls. Each row changes ONE point of ONE source; the harness built from
+# the changed kernels must then fail the run mode over the same scene. A
+# control that still passed would mean the screen cannot see that part of the
+# computation.
+#
+#id	file	old	new	what it would hide
+col-step	col_fill.rb	p = (p + step) % period	p = (p + 0) % period	a column that never moves through its pattern
+col-origin	col_fill.rb	at = y0 * width + x	at = y0 * width	a column drawn at the left edge
+col-count	col_fill.rb	while y <= y1	while y < y1	a column one pixel short
+col-table-row	col_fill.rb	base = row * 16	base = row * 15	a lookup that starts one entry early
+row-sample	row_fill.rb	(pos >> 8) & 7	(pos >> 9) & 7	a sample position read at half its rate
+row-advance	row_fill.rb	pos = (pos + du) & 0xffff	pos = (pos + 0) & 0xffff	a row that repeats its first sample
+row-count	row_fill.rb	while x <= x1	while x < x1	a row one pixel short
+smear-neighbour	col_smear.rb	scr[at + offs[ph] * width]	scr[at]	a pixel read from itself instead of its neighbour
+smear-phase	col_smear.rb	ph = (ph + 1) % period	ph = (ph + 0) % period	every pixel read at the same distance

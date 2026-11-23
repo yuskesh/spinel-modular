@@ -1,0 +1,19 @@
+# NXP MCX N947, the secure Cortex-M33 (CPU0).
+format: spinel-chip
+version: 1
+archs: [armv8-m.main]
+cpu: m33
+values:
+  flash: { origin: 0x10000000, bytes: 2097152 }   # the flash in CPU0's secure alias
+  ram: { origin: 0x30000000, bytes: 327680 }      # RAMA to RAMF, the range Zephyr gives CPU0
+# the flash an image may be loaded in: the two keys name the values that say it
+image:
+  flash_origin: chip.flash.origin
+  flash_bytes: chip.flash.bytes
+board:
+  console.flexcomm: { type: int, one_of: [4] }
+  console.port: { type: int, one_of: [1] }
+  console.rx: { type: int, min: 0, max: 31 }
+  console.tx: { type: int, min: 0, max: 31 }
+  console.mux: { type: int, min: 0, max: 15 }
+  console.baud: { type: int, min: 1 }
