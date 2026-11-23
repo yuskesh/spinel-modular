@@ -184,6 +184,11 @@ of theirs. This repository keeps two: `an521`, the reference family, which
 is the one a suite runs (under QEMU, with no hardware), and `mcxn947`,
 which is here because it has no other home yet.
 
+The RP2040 family and the Raspberry Pi Pico's board file, `rp2040-pico`,
+are kept in [spinel-pico](https://github.com/yuskesh/spinel-pico), under
+its `port/` directory, and are built by naming that directory with
+`--port-dir` ([where boards and chip families are found](#where-boards-and-chip-families-are-found)).
+
 These are the board files in `tools/bare-full/board`, with their chip
 families in `tools/bare-full/chip`. They are valid under `board-check`,
 which `tests/port-contract/boards.sh` runs on each. Every board also has the three policy keys
