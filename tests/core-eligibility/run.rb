@@ -322,13 +322,27 @@ check("a_hung_reader_fails_by_the_cap") do
   end
 end
 
-check("unsupported_loop") do
-  denied("def pick(a); while a < 0; a = 1; end; a; end\npick(1)\n", "unsupported-node")
+# A plain pre-test `while` or `until` in statement position, and `x op= e`,
+# are admitted; the loop's value, a post-test loop and loop control are not.
+check("pre_test_loops") do
+  checked("def pick(a); while a < 0; a = 1; end; a; end\npick(1)\n")
+  checked("def pick(a); until a >= 0; a += 1; end; a; end\npick(1)\n")
+end
+
+check("loop_value") do
+  denied("def pick(a); while a < 0; a = 1; end; end\npick(1)\n", "loop-value", "REFUSED")
+end
+
+check("post_test_loop") do
+  denied("def pick(a); begin; a -= 1; end while a > 0; a; end\npick(1)\n", "unsupported-node")
+end
+
+check("loop_control") do
+  denied("def pick(a); while a < 9; a += 1; break if a > 3; end; a; end\npick(1)\n", "unsupported-node")
 end
 
 # A literal block on a loop is admitted in the checked
-# scalar mode only. This checker's mode refuses loops, and a block loop is
-# refused as a `while` is.
+# scalar mode only. This checker's mode refuses it.
 check("unsupported_block_loop") do
   denied("def pick(a); s = 0; a.times { |i| s = i }; s; end\npick(1)\n", "unsupported-node")
 end

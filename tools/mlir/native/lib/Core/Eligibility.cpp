@@ -611,10 +611,8 @@ class Checker {
       // derivation already handled it, so `n += 1` was an unsupported node
       // while `n = n + 1` was admitted -- two spellings of one statement
       // getting two answers.
-      if (mode != EligibilityMode::CheckedScalar) {
-        issue(&n, "unsupported-node", k);
-        return;
-      }
+      // Admitted on both routes: the operators below are the ones each route
+      // admits as calls, and both lower `x op= e` as `x = x op e`.
       shape(n, {"name", "binary_operator", "value"});
       if (!need(n, "name", AstField::Kind::String) ||
           !need(n, "binary_operator", AstField::Kind::String) ||
@@ -883,11 +881,19 @@ class Checker {
                   "` is in value position, and it produces nothing", "REFUSED");
       return;
     }
-    if (k == "WhileNode") {
-      if (mode != EligibilityMode::CheckedScalar) {
-        issue(&n, "unsupported-node", k);
-        return;
-      }
+    // `until` is `while` with the test inverted, and is admitted where the
+    // lowering has been run with it: the native core route. The status
+    // boundary keeps refusing it.
+    if (k == "WhileNode" ||
+        (k == "UntilNode" && mode != EligibilityMode::CheckedScalar)) {
+      const std::string loopWord = k == "UntilNode" ? "until" : "while";
+      // On the native core route a loop is a statement. Its value is nil in
+      // Ruby, and the types this route reads would say so only indirectly
+      // (`method result is poly`), so the position is refused by name.
+      if (mode != EligibilityMode::CheckedScalar && !inStatementPos(n.id))
+        issue(&n, "loop-value",
+              "the value of a `" + loopWord + "` loop is used; it is nil in "
+              "Ruby, and nil is not in this subset", "REFUSED");
       shape(n, {"flags", "predicate", "statements"});
       if (!need(n, "flags", AstField::Kind::Integer) ||
           !need(n, "predicate", AstField::Kind::Reference) ||
@@ -906,8 +912,8 @@ class Checker {
       const auto flags = number(n, "flags", AstField::Kind::Integer);
       if ((flags & ~static_cast<int64_t>(3)) != 0)
         issue(&n, "unsupported-node",
-              "a `while` with loop flags " + std::to_string(flags) +
-                  "; only a plain pre-test `while` is admitted");
+              "a `" + loopWord + "` with loop flags " + std::to_string(flags) +
+                  "; only a plain pre-test `" + loopWord + "` is admitted");
       // No expression type: a `while` is nil-valued in Ruby, and nil is not in
       // this subset. Using one as a value fails at whatever consumes it.
       child(n, "predicate", owner);

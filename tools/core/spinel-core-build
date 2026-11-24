@@ -393,11 +393,28 @@ check_ledger "the hosted compiler" "$w/hosted.inputs" "$HSRC"
 [ -s "$w/map.tsv" ] || die "the hosted compiler wrote no mapping"
 SYM=$(awk -F'\t' -v r="$root" '$1==r{print $2}' "$w/map.tsv")
 [ -n "$SYM" ] || die "the mapping has no row for '$root'"
-stage 2 "symbol $SYM"
+# The symbol the core object defines. For a method that may run long (it holds
+# a loop), the hosted compiler keeps the mapped symbol for itself: it emits a
+# function of that name which marks the call as one a signal may interrupt and
+# calls SYMBOL__pure, and it declares that function with the mapping's own
+# signature. The declaration is looked for as that exact line; where it is
+# there, SYMBOL__pure is what the core object has to define, and the map the
+# emitter reads says so. A wrong answer here cannot link: the hosted half
+# either defines the mapped symbol or does not.
+SIG=$(awk -F'\t' -v r="$root" '$1==r{print $3}' "$w/map.tsv")
+ENTRY=$SYM
+if [ -n "$SIG" ]; then
+  _pure=$(printf '%s' "$SIG" | awk -v s="$SYM" '{ i = index($0, s "("); if (i) print substr($0, 1, i - 1) s "__pure" substr($0, i + length(s)) ";" }')
+  if [ -n "$_pure" ] && grep -qxF -- "$_pure" "$w/hosted.c"; then ENTRY=${SYM}__pure; fi
+fi
+awk -F'\t' -v OFS='\t' -v r="$root" -v e="$ENTRY" '$1==r{$2=e} {print}' "$w/map.tsv" > "$w/core-map.tsv" \
+  || die "cannot write the core object's mapping"
+if [ "$ENTRY" = "$SYM" ]; then stage 2 "symbol $SYM"
+else stage 2 "symbol $SYM, entered through the hosted wrapper; the core object defines $ENTRY"; fi
 
 # ---- 3. core half ---------------------------------------------------------
 verify snapshot-source "$snap/$SRC"; verify core-emit "$EMIT"; verify typedump "$TYPEDUMP"
-in_snapshot "$EMIT" --source "$SRC" --core-map "$w/map.tsv" -o "$w/core.o" \
+in_snapshot "$EMIT" --source "$SRC" --core-map "$w/core-map.tsv" -o "$w/core.o" \
   --header-out "$w/spinel_core_fail.h" --shim-out "$w/spinel_core_fail.c" \
   --typedump "$TYPEDUMP" --clang "$CLANG" --inputs-out "$w/emit.inputs" \
   > "$w/emit.out" 2>&1 \
@@ -408,7 +425,7 @@ stage 3 "core object"
 # ---- 4. the artifact gate -------------------------------------------------
 verify gate "$GATE"
 # The failure hook is admitted by its exact name, and only it.
-"$GATE" --extern spc_core_fail "$w/core.o" "$SYM" > "$w/gate.out" 2>"$w/gate.err" \
+"$GATE" --extern spc_core_fail "$w/core.o" "$ENTRY" > "$w/gate.out" 2>"$w/gate.err" \
   || { cat "$w/gate.err" >&2; die "the core object did not pass the artifact gate"; }
 stage 4 "artifact gate"
 
