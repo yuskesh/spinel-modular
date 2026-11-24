@@ -78,6 +78,10 @@ runs() {
 runs gcd_sub gcd 0 '9\n3\n3\n6\n'
 runs gcd_sub_spelled gcd 0 '6\n7\n'
 runs gcd_mod gcd 0 '21\n5\n'
+# Each of the eleven `x op= e` operators once, outside a loop; and the six
+# that keep a loop-carried local an Integer, inside one.
+runs op_assign ops 0 '1600\n'
+runs op_assign_loop mix 0 '1000000\n16671\n462\n'
 runs sum sum 0 '0\n5050\n'
 # `until` tests before the body: no turn for 0. A post-test loop would give 1.
 runs until cnt 0 '0\n5\n'
@@ -99,13 +103,17 @@ runs div_zero f 1 '' 'divided by 0 (ZeroDivisionError)'
 
 # ---- a loop that never ends --------------------------------------------------
 # gcd(0, 5) subtracts 0 from 5 for ever. The hosted program marks the call as
-# one a signal may interrupt, so SIGINT ends it as Interrupt does.
+# one a signal may interrupt, so SIGINT ends it as Interrupt does. If SIGINT
+# does not end it within five seconds, SIGKILL does, and the check fails.
 if build never_ends gcd; then
   "$w/never_ends" >/dev/null 2>"$w/never_ends.err" &
   pid=$!
   sleep 1
   kill -INT "$pid" 2>/dev/null || true
+  ( sleep 5; kill -KILL "$pid" 2>/dev/null ) &
+  dog=$!
   set +e; wait "$pid"; st=$?; set -e
+  kill "$dog" 2>/dev/null || true
   [ "$st" = 130 ] && ok "a loop that never ends is ended by SIGINT (exit 130)" \
     || bad "a loop that never ends is ended by SIGINT" "exit $st: $(head -1 "$w/never_ends.err")"
 else
@@ -115,7 +123,7 @@ fi
 # ---- the symbol ---------------------------------------------------------------
 # With a loop, the hosted half defines SYMBOL (a wrapper) and the core object
 # SYMBOL__pure; the driver says so at stage 2. Without one, the core object
-# defines SYMBOL, as before.
+# defines SYMBOL.
 if grep -q 'entered through the hosted wrapper; the core object defines spc_[A-Za-z0-9_]*_gcd__pure$' "$w/gcd_sub.build"; then
   ok "with a loop, the core object defines the __pure symbol"
 else
@@ -131,7 +139,7 @@ fi
 if SPINEL_CORE_VERBOSE=1 "$DRV" --source "$here/fixtures/lower.rb" --core lower -o "$w/lower" >"$w/lower.build" 2>&1 \
    && grep -q '\[2\] symbol spc_[A-Za-z0-9_]*_lower$' "$w/lower.build" \
    && [ "$("$w/lower")" = 3 ]; then
-  ok "without a loop, the core object defines the mapped symbol, as before (prints 3)"
+  ok "without a loop, the core object defines the mapped symbol (prints 3)"
 else
   bad "without a loop, the core object defines the mapped symbol" "$(grep '\[2\]' "$w/lower.build")"
 fi
