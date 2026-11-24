@@ -92,10 +92,12 @@ listed in `tests/ORACLES.tsv` and run only with `ALLOW_ORACLE=1`.
 
 - **Native core** admits a small subset: integer literals, comparisons,
   conditionals, local variables, checked integer arithmetic, bitwise
-  operators and shifts, the listed intrinsics, and direct calls to helpers
-  resolved statically. Float and String arguments, loops, buffers and
-  unresolved calls are refused, and the top level may only define methods
-  and call into the selected closure with integer literals
+  operators and shifts, the listed intrinsics, `while` and `until` loops
+  over integers, and direct calls to helpers resolved statically. Float and
+  String arguments, buffers, unresolved calls, `break` and `next`, and a
+  loop whose locals the hosted analysis types as Bignum are refused, and
+  the top level may only define methods and call into the selected closure
+  with integer literals
   ([what is implemented and what is refused](docs/native-core/supported-envelope.md)).
 - **CORE boundary** admits more, under its contract: integer scalars and
   lent buffers of integer elements, `while` loops and loops with a literal

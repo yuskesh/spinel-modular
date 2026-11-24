@@ -48,6 +48,7 @@ The driver uses the compiler in `vendor/spinel`. `SPINEL_SEAM` and
 tests/native-core/driver.sh
 tests/native-core/ledger.sh
 tests/native-core/arith.sh
+tests/native-core/loops.sh
 ruby tests/core-eligibility/run.rb
 ```
 

@@ -86,7 +86,7 @@ checkout.
 |---|---|
 | Core source eligibility | `ruby tests/core-eligibility/run.rb`, `sh tests/core-eligibility/upstream-fields.sh` |
 | The standalone core object route (x86_64 Linux only; skipped elsewhere) | `SPINEL_CORE_BUILD=tools/mlir/native/build sh tests/core/run.sh` |
-| Native core executables | `sh tests/native-core/run.sh`, and `driver.sh`, `ledger.sh` and `arith.sh` in the same directory |
+| Native core executables | `sh tests/native-core/run.sh`, and `driver.sh`, `ledger.sh`, `arith.sh` and `loops.sh` in the same directory |
 | Native core objects on macOS arm64 (Mach-O) | `ruby tests/native-core/macos-probe.rb` |
 | The CORE boundary | `sh tests/core-boundary/run.sh`; its lanes alone, for example `sh tests/core-boundary/intrinsics.sh` and `sh tests/core-boundary/intrinsics-32.sh` |
 | Bit and word operators | `sh tests/core-bitwise/run.sh` |
